@@ -23,7 +23,7 @@ load_dotenv()
 # Configuration from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-CLINE_COMMAND = ["cline"]  # Removed --no-interactive to keep process alive
+CLINE_COMMAND = ["cline"]  # Use cline without flags to enter interactive mode
 
 def debug_log(level, message, **kwargs):
     """Centralized debug logging function"""
@@ -846,6 +846,9 @@ def main():
     application.add_handler(CommandHandler("start", bot.handle_message))
     application.add_handler(CommandHandler("stop", bot.handle_message))
     application.add_handler(CommandHandler("status", bot.handle_message))
+    application.add_handler(CommandHandler("plan", bot.handle_message))
+    application.add_handler(CommandHandler("act", bot.handle_message))
+    application.add_handler(CommandHandler("cancel", bot.handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     debug_log(DEBUG_DEBUG, "Message handlers added")
 
