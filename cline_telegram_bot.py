@@ -323,8 +323,15 @@ class ClineTelegramBot:
                 echo_pattern = r'^[\s│┃]*' + re.escape(self.current_command) + r'[\s│┃]*$'
                 is_command_echo = bool(re.match(echo_pattern, clean_output.strip()))
         
-        # Preserve welcome screen, filter everything else
-        if not is_welcome_screen and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
+        # Check if this contains mode switch confirmation (important to preserve)
+        is_mode_switch_confirmation = False
+        if self.current_command in ['/plan', '/act']:
+            # Look for mode-related text that should be preserved
+            mode_indicators = ['switch to plan mode', 'switch to act mode', 'plan mode', 'act mode']
+            is_mode_switch_confirmation = any(indicator in clean_output.lower() for indicator in mode_indicators)
+        
+        # Preserve welcome screen and mode switch confirmations, filter everything else
+        if not is_welcome_screen and not is_mode_switch_confirmation and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
             # Only log filtered items occasionally to reduce noise
             if clean_output.strip():
                 debug_log(DEBUG_DEBUG, "Filtered out UI/metadata/echo", 
