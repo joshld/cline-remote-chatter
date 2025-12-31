@@ -488,6 +488,9 @@ class ClineTelegramBot:
                      was_waiting=True)
 
         self.output_queue.append(clean_output)
+        debug_log(DEBUG_DEBUG, "Output added to queue", 
+                 queue_size=len(self.output_queue), 
+                 waiting_for_input=self.waiting_for_input)
 
         if len(self.output_queue) > 100:
             self.output_queue.popleft()
@@ -502,6 +505,7 @@ class ClineTelegramBot:
             return "Error: PTY session not running"
 
         try:
+            # CRITICAL FIX: Reset input state BEFORE sending command
             old_waiting = self.waiting_for_input
             old_prompt = self.input_prompt
             self.waiting_for_input = False
@@ -771,7 +775,17 @@ class ClineTelegramBot:
             debug_log(DEBUG_INFO, "Processing regular command", 
                      command=message_text, session_active=self.session_active)
             
+            # Enhanced debugging: Check state before sending command
+            debug_log(DEBUG_DEBUG, "State before command", 
+                     waiting_for_input=self.waiting_for_input,
+                     queue_size_before=len(self.output_queue),
+                     current_command=self.current_command)
+            
             result = self.send_command(message_text)
+            
+            debug_log(DEBUG_DEBUG, "Command send result", 
+                     result=result,
+                     queue_size_after_send=len(self.output_queue))
             
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -787,13 +801,28 @@ class ClineTelegramBot:
                 )
 
             await asyncio.sleep(0.5)
+            
+            # Enhanced debugging: Check state before getting output
+            debug_log(DEBUG_DEBUG, "Before get_pending_output", 
+                     queue_size=len(self.output_queue),
+                     waiting_for_input=self.is_waiting_for_input())
+            
             output = self.get_pending_output()
+            
+            debug_log(DEBUG_DEBUG, "After get_pending_output", 
+                     got_output=bool(output),
+                     output_length=len(output) if output else 0,
+                     queue_size_after=len(self.output_queue),
+                     waiting_for_input_after=self.is_waiting_for_input())
             
             if not output and self.is_waiting_for_input():
                 debug_log(DEBUG_INFO, "No output but waiting for input, sending Enter to dismiss prompt")
                 self.send_enter()
                 await asyncio.sleep(0.3)
                 output = self.get_pending_output()
+                debug_log(DEBUG_DEBUG, "After Enter key, got output", 
+                         got_output=bool(output),
+                         output_length=len(output) if output else 0)
             
             if output:
                 debug_log(DEBUG_DEBUG, "Immediate output received", output_length=len(output))
@@ -813,6 +842,13 @@ class ClineTelegramBot:
                 )
             else:
                 debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
+                # Enhanced: Check if queue is being populated by background thread
+                await asyncio.sleep(1)
+                queue_after_wait = len(self.output_queue)
+                debug_log(DEBUG_DEBUG, "Queue after 1 second wait", 
+                         queue_size=queue_after_wait)
+                if queue_after_wait > 0:
+                    debug_log(DEBUG_WARN, "Output appeared after delay - this suggests timing issue")
         else:
             debug_log(DEBUG_WARN, "Command received but session not active", 
                      message_text=message_text, session_active=self.session_active)
