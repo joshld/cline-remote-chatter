@@ -193,6 +193,11 @@ ps aux | grep cline_telegram_bot | grep -v grep
 echo "View logs: tail -f bot.log"
 ```
 
+### Kill All Cline Processes (One-Liner)
+```bash
+pkill -9 -f "cline" && pkill -9 -f "cline-host" && pkill -9 -f "cline-core"
+```
+
 ## Notes
 
 - The bot runs continuously in the background
