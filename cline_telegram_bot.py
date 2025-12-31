@@ -11,6 +11,7 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+import psutil
 
 def strip_ansi_codes(text):
     """Remove ANSI escape sequences from text"""
@@ -23,14 +24,13 @@ load_dotenv()
 # Configuration from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-CLINE_COMMAND = ["cline"]  # Use cline without flags to enter interactive mode
+CLINE_COMMAND = ["cline"]
 
 def debug_log(level, message, **kwargs):
     """Centralized debug logging function"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     prefix = f"[{timestamp}] [{level}]"
     
-    # Add context if provided
     if kwargs:
         context = " | ".join([f"{k}={v}" for k, v in kwargs.items()])
         message = f"{prefix} {message} | {context}"
@@ -68,6 +68,9 @@ class ClineTelegramBot:
         # Session state
         self.session_active = False
         
+        # Process tracking for cleanup
+        self.child_pids = set()
+        
         # Application reference for notifications
         self.application = None
         
@@ -75,9 +78,93 @@ class ClineTelegramBot:
                  master_fd=self.master_fd, slave_fd=self.slave_fd, 
                  is_running=self.is_running, session_active=self.session_active)
 
+    def _find_child_processes(self, parent_pid):
+        """Find all child processes of a given PID"""
+        children = set()
+        try:
+            parent = psutil.Process(parent_pid)
+            # Get all descendants
+            for child in parent.children(recursive=True):
+                children.add(child.pid)
+            # Also add the parent itself
+            children.add(parent_pid)
+        except psutil.NoSuchProcess:
+            pass
+        return children
+
+    def _kill_process_tree(self, pid):
+        """Kill a process and all its children"""
+        try:
+            children = self._find_child_processes(pid)
+            debug_log(DEBUG_DEBUG, "Killing process tree", parent_pid=pid, children_count=len(children))
+            
+            for child_pid in children:
+                try:
+                    process = psutil.Process(child_pid)
+                    # Try graceful termination first
+                    process.terminate()
+                except psutil.NoSuchProcess:
+                    continue
+            
+            # Wait for processes to terminate
+            time.sleep(0.5)
+            
+            # Force kill any remaining processes
+            for child_pid in children:
+                try:
+                    process = psutil.Process(child_pid)
+                    if process.is_running():
+                        process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            # Wait for cleanup
+            time.sleep(0.2)
+            debug_log(DEBUG_DEBUG, "Process tree killed", parent_pid=pid)
+            
+        except Exception as e:
+            debug_log(DEBUG_ERROR, "Error killing process tree", 
+                     pid=pid, error_type=type(e).__name__, error=str(e))
+
+    def _ensure_session_clean(self):
+        """Ensure no existing Cline processes are running"""
+        debug_log(DEBUG_INFO, "Checking for existing Cline processes")
+        
+        # Look for any running cline processes
+        cline_processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info['cmdline'] or []
+                cmdline_str = ' '.join(cmdline)
+                if 'cline' in cmdline_str and 'python' not in cmdline_str:
+                    cline_processes.append(proc.info['pid'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        
+        if cline_processes:
+            debug_log(DEBUG_WARN, "Found existing Cline processes", 
+                     pids=cline_processes, count=len(cline_processes))
+            
+            for pid in cline_processes:
+                self._kill_process_tree(pid)
+            
+            # Wait for cleanup
+            time.sleep(1)
+            debug_log(DEBUG_INFO, "Cleaned up existing processes")
+        else:
+            debug_log(DEBUG_DEBUG, "No existing Cline processes found")
+
     def start_pty_session(self, application=None):
-        """Start PTY session with background output reader"""
+        """Start PTY session with proper process management"""
         debug_log(DEBUG_INFO, "start_pty_session called")
+        
+        # Check if already running
+        if self.session_active:
+            debug_log(DEBUG_WARN, "Session already active, refusing to start new one")
+            return False
+        
+        # Ensure clean state before starting
+        self._ensure_session_clean()
         
         try:
             debug_log(DEBUG_DEBUG, "Opening PTY...")
@@ -88,24 +175,29 @@ class ClineTelegramBot:
             debug_log(DEBUG_DEBUG, "Starting subprocess", 
                      command=CLINE_COMMAND, slave_fd=self.slave_fd)
             
-            # Start Cline with proper environment for interactive session
-            # Remove --no-interactive flag to keep Cline running
+            # Start Cline with proper environment
             env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
             
-            # Use cline without --no-interactive to keep it alive
-            cline_cmd = ["cline"]
-            
+            # Use process group to kill entire tree
             self.process = subprocess.Popen(
-                cline_cmd,
+                CLINE_COMMAND,
                 stdin=self.slave_fd,
                 stdout=self.slave_fd,
                 stderr=self.slave_fd,
-                preexec_fn=os.setsid,
+                preexec_fn=os.setsid,  # Create new process group
                 env=env
             )
             
             debug_log(DEBUG_DEBUG, "Subprocess started", 
                      pid=self.process.pid, returncode=self.process.poll())
+
+            # Track the main process
+            self.child_pids = {self.process.pid}
+            
+            # Wait a moment and check if process is still alive
+            time.sleep(0.5)
+            if self.process.poll() is not None:
+                raise RuntimeError("Cline process died immediately")
 
             self.is_running = True
             self.session_active = True
@@ -121,7 +213,7 @@ class ClineTelegramBot:
 
             debug_log(DEBUG_INFO, "PTY session started successfully")
             
-            # Wait a moment for Cline to initialize
+            # Wait for Cline to initialize
             time.sleep(1)
             
             # Send session start notification
@@ -154,48 +246,47 @@ class ClineTelegramBot:
         except Exception as e:
             debug_log(DEBUG_ERROR, "Failed to start PTY session", 
                      error_type=type(e).__name__, error=str(e), exc_info=True)
+            # Cleanup on failure
+            self._cleanup_resources()
             return False
 
     def stop_pty_session(self, application=None):
-        """Stop PTY session and cleanup"""
+        """Stop PTY session with comprehensive cleanup"""
         debug_log(DEBUG_INFO, "stop_pty_session called")
         
+        if not self.session_active:
+            debug_log(DEBUG_DEBUG, "No active session to stop")
+            return
+
         self.stop_reading = True
         self.session_active = False
         debug_log(DEBUG_DEBUG, "State updated", 
                  stop_reading=self.stop_reading, session_active=self.session_active)
 
+        # Kill all tracked processes
         if self.process:
             debug_log(DEBUG_DEBUG, "Stopping process", 
                      pid=self.process.pid, returncode=self.process.poll())
-            try:
-                debug_log(DEBUG_DEBUG, "Sending SIGTERM")
-                os.killpg(os.getpgid(self.process.pid), 15)
-                time.sleep(1)
-                if self.process.poll() is None:
-                    debug_log(DEBUG_WARN, "Process still running, sending SIGKILL")
-                    os.killpg(os.getpgid(self.process.pid), 9)
-                else:
-                    debug_log(DEBUG_DEBUG, "Process terminated with SIGTERM")
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Error stopping process", 
-                         error_type=type(e).__name__, error=str(e))
-                pass
+            
+            # Kill the entire process tree
+            self._kill_process_tree(self.process.pid)
+            
+            # Also kill any processes we might have missed
+            self._ensure_session_clean()
 
-        if self.master_fd:
-            debug_log(DEBUG_DEBUG, "Closing master_fd", fd=self.master_fd)
-            try:
-                os.close(self.master_fd)
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Error closing master_fd", error=str(e))
+        # Wait for output thread to finish
+        if self.output_thread and self.output_thread.is_alive():
+            debug_log(DEBUG_DEBUG, "Waiting for output thread to finish")
+            self.output_thread.join(timeout=2.0)
+            if self.output_thread.is_alive():
+                debug_log(DEBUG_WARN, "Output thread did not finish cleanly")
 
-        if self.slave_fd:
-            debug_log(DEBUG_DEBUG, "Closing slave_fd", fd=self.slave_fd)
-            try:
-                os.close(self.slave_fd)
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Error closing slave_fd", error=str(e))
+        # Cleanup file descriptors
+        self._cleanup_file_descriptors()
 
+        # Reset state
+        self.process = None
+        self.child_pids.clear()
         self.is_running = False
         debug_log(DEBUG_DEBUG, "Final state", is_running=self.is_running)
         debug_log(DEBUG_INFO, "PTY session stopped")
@@ -222,6 +313,53 @@ class ClineTelegramBot:
                 debug_log(DEBUG_ERROR, "Failed to schedule session stop notification", 
                          error_type=type(e).__name__, error=str(e))
 
+    def _cleanup_file_descriptors(self):
+        """Close file descriptors safely"""
+        if self.master_fd:
+            debug_log(DEBUG_DEBUG, "Closing master_fd", fd=self.master_fd)
+            try:
+                os.close(self.master_fd)
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Error closing master_fd", error=str(e))
+            self.master_fd = None
+
+        if self.slave_fd:
+            debug_log(DEBUG_DEBUG, "Closing slave_fd", fd=self.slave_fd)
+            try:
+                os.close(self.slave_fd)
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Error closing slave_fd", error=str(e))
+            self.slave_fd = None
+
+    def _cleanup_resources(self):
+        """Comprehensive cleanup of all resources"""
+        debug_log(DEBUG_INFO, "Performing comprehensive cleanup")
+        
+        # Stop reading
+        self.stop_reading = True
+        
+        # Kill processes
+        if self.process:
+            self._kill_process_tree(self.process.pid)
+            self.process = None
+        
+        # Ensure clean state
+        self._ensure_session_clean()
+        
+        # Cleanup file descriptors
+        self._cleanup_file_descriptors()
+        
+        # Reset state
+        self.is_running = False
+        self.session_active = False
+        self.child_pids.clear()
+        
+        # Clear queues
+        self.output_queue.clear()
+        self.command_queue.clear()
+        
+        debug_log(DEBUG_DEBUG, "Cleanup complete")
+
     def _output_reader(self):
         """Background thread to continuously read PTY output"""
         debug_log(DEBUG_INFO, "Output reader thread started")
@@ -240,7 +378,8 @@ class ClineTelegramBot:
                         read_count += 1
                         self._process_output(output)
                     else:
-                        # EOF reached
+                        # EOF reached - process died
+                        debug_log(DEBUG_WARN, "EOF received from PTY")
                         break
                 else:
                     # Timeout, no data available
@@ -257,47 +396,31 @@ class ClineTelegramBot:
 
     def _process_output(self, output):
         """Process incoming output from Cline"""
-        # Strip ANSI codes for cleaner processing
         clean_output = strip_ansi_codes(output)
         
         # Filter out Cline CLI UI prompts and repetitive UI elements
-        # These are not actual responses, just interface elements
-        
-        # Check for common UI patterns even in partial chunks
         ui_indicators = [
-            '╭', '╰', '│', '┃', '╮', '╯',  # Box drawing characters
-            'cline cli preview',             # Header
-            '/plan or /act',                 # Mode switch
-            'alt+enter',                     # Help text
-            'openrouter/xiaomi',             # Model info
-            '~/cline-workspace',             # Path
-            'enter submit',                  # Help text
-            'new line',                      # Help text
-            'open editor',                   # Help text
+            '╭', '╰', '│', '┃', '╮', '╯',
+            'cline cli preview',
+            '/plan or /act',
+            'alt+enter',
+            'openrouter/xiaomi',
+            '~/cline-workspace',
+            'enter submit',
+            'new line',
+            'open editor',
         ]
         
-        # Check if output is mostly UI elements
         ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
-        
-        # Also check for empty or whitespace-only lines
         lines = clean_output.split('\n')
         empty_lines = sum(1 for line in lines if not line.strip())
         
-        # Check if this is the initial welcome screen
         is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-        
-        # If it's mostly UI or mostly empty, filter it out
-        # BUT preserve the welcome screen
         is_ui_heavy = ui_score >= 2 and not is_welcome_screen
         is_ui_heavy = is_ui_heavy or (len(lines) > 0 and empty_lines / len(lines) > 0.5)
-        
-        # Also filter single characters that are likely box drawing
         is_box_char = clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯']
-        
-        # Filter lines that are just spaces and box characters
         is_box_line = bool(re.match(r'^[\s│┃╭╰╮╯]+$', clean_output.strip()))
         
-        # Filter API metadata and completion messages
         api_patterns = [
             r'## API request completed',
             r'↑.*↓.*\$',
@@ -307,52 +430,36 @@ class ClineTelegramBot:
         ]
         is_api_metadata = any(re.search(pattern, clean_output, re.IGNORECASE) for pattern in api_patterns)
         
-        # Check if this is command echo (Cline showing what you typed)
-        # Only filter if it's EXACTLY the command with box characters, not if it has other text
-        # Example to filter: "┃ /act" or "│ /act"
-        # Example to keep: "go for it /act" (has other text)
-        # Also: Don't filter if it's a mode switch command (/plan or /act) - we want to see those!
         is_command_echo = False
         if self.current_command:
-            # Don't filter mode switch commands - they're important to see
-            if self.current_command in ['/plan', '/act']:
-                is_command_echo = False
-            else:
-                # Check if line is just box chars + command (echo to filter)
-                # But NOT if there's other text before/after
+            if self.current_command not in ['/plan', '/act']:
                 echo_pattern = r'^[\s│┃]*' + re.escape(self.current_command) + r'[\s│┃]*$'
                 is_command_echo = bool(re.match(echo_pattern, clean_output.strip()))
         
-        # Check if this contains mode switch confirmation (important to preserve)
         is_mode_switch_confirmation = False
         if self.current_command in ['/plan', '/act']:
-            # Look for mode-related text that should be preserved
             mode_indicators = ['switch to plan mode', 'switch to act mode', 'plan mode', 'act mode']
             is_mode_switch_confirmation = any(indicator in clean_output.lower() for indicator in mode_indicators)
         
-        # Preserve welcome screen and mode switch confirmations, filter everything else
         if not is_welcome_screen and not is_mode_switch_confirmation and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
-            # Only log filtered items occasionally to reduce noise
             if clean_output.strip():
                 debug_log(DEBUG_DEBUG, "Filtered out UI/metadata/echo", 
                          preview=clean_output[:30].replace('\n', '\\n'))
-            return  # Don't add to queue
+            return
         
-        # Only log queued output occasionally
         if clean_output.strip() and len(clean_output) > 20:
             debug_log(DEBUG_DEBUG, "Queued output", 
                      preview=clean_output[:50].replace('\n', '\\n'))
 
-        # Check for interactive prompts (use clean output)
         prompt_patterns = [
             r'\[y/N\]', r'\[Y/n\]', r'\(y/n\)', r'\(Y/N\)',
             r'Continue\?', r'Proceed\?', r'Are you sure\?',
             r'Enter .*:\s*$', r'Password:\s*$',
-            r'Press.*Enter.*to.*continue',  # "Press Enter to continue"
-            r'Press.*any.*key',             # "Press any key"
-            r'\[.*\]\s*$',                  # "[Press Enter]"
-            r'Press.*to.*exit',             # "Press any key to exit"
-            r'Press.*to.*return',           # "Press any key to return"
+            r'Press.*Enter.*to.*continue',
+            r'Press.*any.*key',
+            r'\[.*\]\s*$',
+            r'Press.*to.*exit',
+            r'Press.*to.*return',
         ]
 
         prompt_detected = False
@@ -367,9 +474,7 @@ class ClineTelegramBot:
                          old_state=old_state, new_state=self.waiting_for_input)
                 break
 
-        # Also check for common continuation patterns in Cline CLI
         if not prompt_detected:
-            # Check if output ends with a prompt-like pattern
             if re.search(r'[\[\(].*[\]\)]\s*$', clean_output.strip()):
                 old_state = self.waiting_for_input
                 self.waiting_for_input = True
@@ -382,10 +487,8 @@ class ClineTelegramBot:
             debug_log(DEBUG_DEBUG, "Output received while waiting for input", 
                      was_waiting=True)
 
-        # Add to output queue (store clean output)
         self.output_queue.append(clean_output)
 
-        # Keep queue size manageable
         if len(self.output_queue) > 100:
             self.output_queue.popleft()
             debug_log(DEBUG_WARN, "Queue overflow, removing oldest entry")
@@ -399,7 +502,6 @@ class ClineTelegramBot:
             return "Error: PTY session not running"
 
         try:
-            # Reset input waiting state
             old_waiting = self.waiting_for_input
             old_prompt = self.input_prompt
             self.waiting_for_input = False
@@ -408,13 +510,11 @@ class ClineTelegramBot:
                      old_waiting=old_waiting, old_prompt_preview=old_prompt[:30] if old_prompt else None,
                      new_waiting=self.waiting_for_input)
 
-            # Cline CLI is an interactive tool that needs proper submission
-            # Try different submission methods
             submission_methods = [
-                f"{command}\n",           # Standard newline
-                f"{command}\r",           # Carriage return
-                f"{command}\r\n",         # CRLF
-                f"{command}\x04",         # Ctrl+D (EOF)
+                f"{command}\n",
+                f"{command}\r",
+                f"{command}\r\n",
+                f"{command}\x04",
             ]
             
             for i, method in enumerate(submission_methods):
@@ -426,17 +526,14 @@ class ClineTelegramBot:
                 debug_log(DEBUG_DEBUG, f"Method {i+1} bytes written", 
                          bytes_written=bytes_written, expected=len(command_bytes))
                 
-                # Give Cline time to process
                 time.sleep(0.3)
                 
-                # Check if we got any output
                 if len(self.output_queue) > 0:
                     debug_log(DEBUG_INFO, f"Success with method {i+1}", method_num=i+1)
                     break
             
             self.current_command = command
             
-            # Check if process is still alive
             if self.process:
                 returncode = self.process.poll()
                 debug_log(DEBUG_DEBUG, "Subprocess status", 
@@ -461,10 +558,9 @@ class ClineTelegramBot:
             return False
 
         try:
-            # Send just a newline to dismiss prompts like "Press Enter to continue"
             os.write(self.master_fd, b"\n")
             debug_log(DEBUG_DEBUG, "Enter key sent")
-            time.sleep(0.2)  # Brief pause for Cline to process
+            time.sleep(0.2)
             return True
         except Exception as e:
             debug_log(DEBUG_ERROR, "Failed to send Enter", 
@@ -481,7 +577,6 @@ class ClineTelegramBot:
             debug_log(DEBUG_DEBUG, "No pending output")
             return None
 
-        # Combine available output
         combined = ""
         chunks_used = 0
         original_queue_size = queue_size
@@ -489,7 +584,6 @@ class ClineTelegramBot:
         while self.output_queue and len(combined) < max_length:
             chunk = self.output_queue.popleft()
             if len(combined + chunk) > max_length:
-                # Put back the chunk that would exceed limit
                 self.output_queue.appendleft(chunk)
                 debug_log(DEBUG_DEBUG, "Hit max length limit", 
                          combined_len=len(combined), chunk_len=len(chunk),
@@ -570,17 +664,14 @@ class ClineTelegramBot:
         if message_text == "/cancel":
             debug_log(DEBUG_INFO, "Processing /cancel command")
             if self.session_active:
-                # Send Ctrl+C to Cline to cancel current task
-                result = self.send_command("\x03")  # Ctrl+C
+                result = self.send_command("\x03")
                 debug_log(DEBUG_DEBUG, "Cancel signal sent", result=result)
                 
-                # Send confirmation without quoting
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="🛑 Cancel signal sent to Cline"
                 )
                 
-                # Wait a moment and check for output
                 await asyncio.sleep(0.5)
                 output = self.get_pending_output()
                 if output:
@@ -595,7 +686,6 @@ class ClineTelegramBot:
         if message_text == "/plan":
             debug_log(DEBUG_INFO, "Processing /plan command")
             if self.session_active:
-                # Send /plan to Cline to switch to plan mode
                 result = self.send_command("/plan")
                 debug_log(DEBUG_DEBUG, "Plan mode switch sent", result=result)
                 
@@ -604,7 +694,6 @@ class ClineTelegramBot:
                     text="📋 Switched Cline to **PLAN MODE**"
                 )
                 
-                # Wait for response
                 await asyncio.sleep(0.5)
                 output = self.get_pending_output()
                 if output:
@@ -619,7 +708,6 @@ class ClineTelegramBot:
         if message_text == "/act":
             debug_log(DEBUG_INFO, "Processing /act command")
             if self.session_active:
-                # Send /act to Cline to switch to act mode
                 result = self.send_command("/act")
                 debug_log(DEBUG_DEBUG, "Act mode switch sent", result=result)
                 
@@ -628,7 +716,6 @@ class ClineTelegramBot:
                     text="⚡ Switched Cline to **ACT MODE**"
                 )
                 
-                # Wait for response
                 await asyncio.sleep(0.5)
                 output = self.get_pending_output()
                 debug_log(DEBUG_DEBUG, "After /act - queue size", 
@@ -639,7 +726,6 @@ class ClineTelegramBot:
                         text=output
                     )
                 else:
-                    # Send status even if no output
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         text="ℹ️ Command sent. Waiting for Cline response..."
@@ -654,18 +740,15 @@ class ClineTelegramBot:
                      waiting_for_input=self.waiting_for_input,
                      prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
             
-            # Send user input directly
             result = self.send_command(message_text)
             debug_log(DEBUG_DEBUG, "Interactive input sent", 
                      input=message_text, result=result)
             
-            # Send confirmation without quoting
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"📤 Input sent: {message_text}"
             )
 
-            # Wait a moment for response
             await asyncio.sleep(0.5)
             output = self.get_pending_output()
             if output:
@@ -675,7 +758,6 @@ class ClineTelegramBot:
                     chat_id=update.effective_chat.id,
                     text=output
                 )
-                # Send completion indicator
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="✅ Response complete"
@@ -689,16 +771,13 @@ class ClineTelegramBot:
             debug_log(DEBUG_INFO, "Processing regular command", 
                      command=message_text, session_active=self.session_active)
             
-            # Send command
             result = self.send_command(message_text)
             
-            # Send confirmation without quoting
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"📤 {result}"
             )
 
-            # For long-running tasks, acknowledge once
             is_long_running = any(keyword in message_text.lower() for keyword in ['run', 'build', 'install', 'download', 'clone'])
             if is_long_running:
                 debug_log(DEBUG_INFO, "Long-running task detected", command=message_text)
@@ -707,11 +786,9 @@ class ClineTelegramBot:
                     text="⏳ Long-running task started. Output will be sent as it becomes available..."
                 )
 
-            # Check for immediate output
             await asyncio.sleep(0.5)
             output = self.get_pending_output()
             
-            # If no output but waiting for input, send Enter to dismiss continuation prompt
             if not output and self.is_waiting_for_input():
                 debug_log(DEBUG_INFO, "No output but waiting for input, sending Enter to dismiss prompt")
                 self.send_enter()
@@ -720,7 +797,6 @@ class ClineTelegramBot:
             
             if output:
                 debug_log(DEBUG_DEBUG, "Immediate output received", output_length=len(output))
-                # Send output in chunks if needed
                 chunks = [output[i:i+4000] for i in range(0, len(output), 4000)]
                 debug_log(DEBUG_DEBUG, "Sending output in chunks", 
                          total_chunks=len(chunks), total_length=len(output))
@@ -731,14 +807,12 @@ class ClineTelegramBot:
                     )
                     debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
                 
-                # Send completion indicator
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="✅ Response complete"
                 )
             else:
                 debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
-                # Don't send "waiting" message - let output_monitor handle it
         else:
             debug_log(DEBUG_WARN, "Command received but session not active", 
                      message_text=message_text, session_active=self.session_active)
@@ -749,18 +823,17 @@ async def output_monitor(bot_instance, application):
     debug_log(DEBUG_INFO, "Output monitor started")
     iteration_count = 0
     last_send_time = 0
-    RATE_LIMIT_SECONDS = 3  # Minimum seconds between sends
+    RATE_LIMIT_SECONDS = 3
     
     while True:
         iteration_count += 1
-        if iteration_count % 30 == 0:  # Log every 60 seconds
+        if iteration_count % 30 == 0:
             debug_log(DEBUG_DEBUG, "Output monitor heartbeat", iterations=iteration_count)
         
         if bot_instance.session_active and bot_instance.output_queue:
             debug_log(DEBUG_DEBUG, "Output monitor found data", 
                      queue_size=len(bot_instance.output_queue))
             
-            # Check rate limit
             current_time = time.time()
             if current_time - last_send_time < RATE_LIMIT_SECONDS:
                 debug_log(DEBUG_DEBUG, "Rate limited, waiting", 
@@ -770,13 +843,9 @@ async def output_monitor(bot_instance, application):
             
             output = bot_instance.get_pending_output()
             if output:
-                # Filter out UI elements before sending
                 clean_output = strip_ansi_codes(output)
                 
-                # Check if this is the welcome screen (preserve it)
                 is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-                
-                # Check if output is mostly UI (but preserve welcome screen)
                 ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
                 ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
                 
@@ -788,7 +857,6 @@ async def output_monitor(bot_instance, application):
                 debug_log(DEBUG_INFO, "Sending output to user", 
                          output_length=len(clean_output))
                 try:
-                    # Send output to authorized user
                     await application.bot.send_message(
                         chat_id=AUTHORIZED_USER_ID,
                         text=clean_output
@@ -806,14 +874,13 @@ async def output_monitor(bot_instance, application):
             elif not bot_instance.output_queue:
                 debug_log(DEBUG_DEBUG, "Output monitor: queue empty")
 
-        await asyncio.sleep(2)  # Check every 2 seconds
+        await asyncio.sleep(2)
 
     debug_log(DEBUG_INFO, "Output monitor stopped")
 
 def main():
     debug_log(DEBUG_INFO, "main() called")
     
-    # Validate configuration
     debug_log(DEBUG_DEBUG, "Validating configuration", 
              token_present=bool(TELEGRAM_BOT_TOKEN),
              authorized_user_id=AUTHORIZED_USER_ID,
@@ -838,11 +905,9 @@ def main():
                  error_type=type(e).__name__, error=str(e))
         return
 
-    # Set application reference in bot for notifications
     bot.application = application
     debug_log(DEBUG_DEBUG, "Application reference set in bot")
 
-    # Add handlers
     application.add_handler(CommandHandler("start", bot.handle_message))
     application.add_handler(CommandHandler("stop", bot.handle_message))
     application.add_handler(CommandHandler("status", bot.handle_message))
@@ -852,7 +917,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     debug_log(DEBUG_DEBUG, "Message handlers added")
 
-    # Start output monitoring task
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(output_monitor(bot, application))
@@ -864,7 +928,6 @@ def main():
     debug_log(DEBUG_INFO, "Bot starting with long-running task support")
     print("Bot started with long-running task support")
     
-    # Send startup notification
     async def send_startup_notification():
         try:
             await application.bot.send_message(
@@ -882,7 +945,6 @@ def main():
             debug_log(DEBUG_ERROR, "Failed to send startup notification", 
                      error_type=type(e).__name__, error=str(e))
 
-    # Send shutdown notification
     async def send_shutdown_notification():
         try:
             await application.bot.send_message(
@@ -895,7 +957,6 @@ def main():
             debug_log(DEBUG_ERROR, "Failed to send shutdown notification", 
                      error_type=type(e).__name__, error=str(e))
 
-    # Schedule startup notification
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(send_startup_notification())
@@ -904,11 +965,9 @@ def main():
                  error_type=type(e).__name__, error=str(e))
 
     try:
-        # Add shutdown handler
         def signal_handler(signum, frame):
             debug_log(DEBUG_INFO, f"Received signal {signum}, initiating shutdown")
             try:
-                # Schedule shutdown notification
                 loop = asyncio.get_event_loop()
                 if not loop.is_closed():
                     loop.create_task(send_shutdown_notification())
@@ -916,17 +975,14 @@ def main():
                 debug_log(DEBUG_ERROR, "Failed to schedule shutdown notification", 
                          error_type=type(e).__name__, error=str(e))
             
-            # Stop any active session
             if bot.session_active:
                 debug_log(DEBUG_INFO, "Stopping active session due to shutdown")
                 bot.stop_pty_session()
             
-            # Exit
             debug_log(DEBUG_INFO, "Bot shutting down")
             import sys
             sys.exit(0)
 
-        # Register signal handlers
         import signal
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -937,7 +993,6 @@ def main():
     except Exception as e:
         debug_log(DEBUG_ERROR, "Bot polling failed", 
                  error_type=type(e).__name__, error=str(e), exc_info=True)
-        # Try to send error notification
         try:
             loop = asyncio.get_event_loop()
             if not loop.is_closed():
