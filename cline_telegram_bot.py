@@ -23,7 +23,7 @@ load_dotenv()
 # Configuration from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-CLINE_COMMAND = ["cline", "--no-interactive"]
+CLINE_COMMAND = ["cline"]  # Removed --no-interactive to keep process alive
 
 def debug_log(level, message, **kwargs):
     """Centralized debug logging function"""
@@ -88,13 +88,20 @@ class ClineTelegramBot:
             debug_log(DEBUG_DEBUG, "Starting subprocess", 
                      command=CLINE_COMMAND, slave_fd=self.slave_fd)
             
+            # Start Cline with proper environment for interactive session
+            # Remove --no-interactive flag to keep Cline running
+            env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
+            
+            # Use cline without --no-interactive to keep it alive
+            cline_cmd = ["cline"]
+            
             self.process = subprocess.Popen(
-                CLINE_COMMAND,
+                cline_cmd,
                 stdin=self.slave_fd,
                 stdout=self.slave_fd,
                 stderr=self.slave_fd,
                 preexec_fn=os.setsid,
-                env=dict(os.environ, TERM='xterm-256color')
+                env=env
             )
             
             debug_log(DEBUG_DEBUG, "Subprocess started", 
@@ -114,6 +121,9 @@ class ClineTelegramBot:
 
             debug_log(DEBUG_INFO, "PTY session started successfully")
             
+            # Wait a moment for Cline to initialize
+            time.sleep(1)
+            
             # Send session start notification
             if application:
                 async def send_session_start_notification():
@@ -122,7 +132,11 @@ class ClineTelegramBot:
                             chat_id=AUTHORIZED_USER_ID,
                             text="🟢 **Cline Session Started**\n\n"
                                  "PTY session is now active and ready for commands.\n"
-                                 "Output will be sent automatically as it becomes available."
+                                 "Output will be sent automatically as it becomes available.\n\n"
+                                 "**Mode Commands:**\n"
+                                 "/plan - Switch to plan mode\n"
+                                 "/act - Switch to act mode\n"
+                                 "/cancel - Cancel current task"
                         )
                         debug_log(DEBUG_INFO, "Session start notification sent")
                     except Exception as e:
