@@ -505,7 +505,7 @@ class ClineTelegramBot:
             return "Error: PTY session not running"
 
         try:
-            # CRITICAL FIX: Reset input state BEFORE sending command
+            # Reset input state BEFORE sending command
             old_waiting = self.waiting_for_input
             old_prompt = self.input_prompt
             self.waiting_for_input = False
@@ -513,6 +513,12 @@ class ClineTelegramBot:
             debug_log(DEBUG_DEBUG, "Reset input state", 
                      old_waiting=old_waiting, old_prompt_preview=old_prompt[:30] if old_prompt else None,
                      new_waiting=self.waiting_for_input)
+
+            # Clear any existing output before sending new command
+            pre_clear_size = len(self.output_queue)
+            if pre_clear_size > 0:
+                debug_log(DEBUG_DEBUG, "Clearing pre-existing output", queue_size=pre_clear_size)
+                self.output_queue.clear()
 
             submission_methods = [
                 f"{command}\n",
@@ -753,8 +759,21 @@ class ClineTelegramBot:
                 text=f"📤 Input sent: {message_text}"
             )
 
-            await asyncio.sleep(0.5)
-            output = self.get_pending_output()
+            # Enhanced output collection for interactive input
+            output = None
+            for retry in range(3):
+                await asyncio.sleep(0.3)
+                current_output = self.get_pending_output()
+                if current_output:
+                    if not output:
+                        output = current_output
+                    else:
+                        output += current_output
+                    
+                    # If we're still waiting for input, continue
+                    if not self.is_waiting_for_input():
+                        break
+            
             if output:
                 debug_log(DEBUG_DEBUG, "Interactive output received", 
                          output_length=len(output))
@@ -768,6 +787,10 @@ class ClineTelegramBot:
                 )
             else:
                 debug_log(DEBUG_DEBUG, "No output received after interactive input")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="ℹ️ Input sent. Waiting for response..."
+                )
             return
 
         # Regular commands
@@ -800,32 +823,70 @@ class ClineTelegramBot:
                     text="⏳ Long-running task started. Output will be sent as it becomes available..."
                 )
 
-            await asyncio.sleep(0.5)
+            # Enhanced output collection with retry logic
+            output = None
+            max_retries = 3
+            retry_delay = 0.4
             
-            # Enhanced debugging: Check state before getting output
-            debug_log(DEBUG_DEBUG, "Before get_pending_output", 
-                     queue_size=len(self.output_queue),
-                     waiting_for_input=self.is_waiting_for_input())
+            for retry in range(max_retries):
+                debug_log(DEBUG_DEBUG, f"Output collection attempt {retry + 1}/{max_retries}")
+                
+                # Check current state
+                queue_size = len(self.output_queue)
+                is_waiting = self.is_waiting_for_input()
+                
+                debug_log(DEBUG_DEBUG, "State check", 
+                         queue_size=queue_size, waiting_for_input=is_waiting, retry=retry)
+                
+                # Try to get output
+                current_output = self.get_pending_output()
+                
+                if current_output:
+                    if not output:
+                        output = current_output
+                    else:
+                        output += current_output
+                    
+                    debug_log(DEBUG_DEBUG, "Got output on this attempt", 
+                             chunk_length=len(current_output), total_length=len(output))
+                    
+                    # If we're not waiting for input, we might have more coming
+                    if not is_waiting and retry < max_retries - 1:
+                        debug_log(DEBUG_DEBUG, "Not waiting for input, checking for more output")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        break
+                else:
+                    # No output yet
+                    debug_log(DEBUG_DEBUG, "No output on this attempt", 
+                             waiting_for_input=is_waiting, queue_size=queue_size)
+                    
+                    # If waiting for input, send Enter to dismiss prompt
+                    if is_waiting and retry == 0:
+                        debug_log(DEBUG_INFO, "Waiting for input detected, sending Enter")
+                        self.send_enter()
+                        await asyncio.sleep(0.2)
+                        continue
+                    
+                    # If this is a long-running command, give it more time
+                    is_long_running = any(keyword in message_text.lower() for keyword in ['run', 'build', 'install', 'download', 'clone', 'test'])
+                    if is_long_running and retry < max_retries - 1:
+                        debug_log(DEBUG_DEBUG, "Long-running command, extending wait time")
+                        await asyncio.sleep(0.6)
+                        continue
+                    
+                    # Wait before next retry
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
             
-            output = self.get_pending_output()
-            
-            debug_log(DEBUG_DEBUG, "After get_pending_output", 
-                     got_output=bool(output),
-                     output_length=len(output) if output else 0,
-                     queue_size_after=len(self.output_queue),
-                     waiting_for_input_after=self.is_waiting_for_input())
-            
-            if not output and self.is_waiting_for_input():
-                debug_log(DEBUG_INFO, "No output but waiting for input, sending Enter to dismiss prompt")
-                self.send_enter()
-                await asyncio.sleep(0.3)
+            # Final check: if still no output but queue has data, try one more time
+            if not output and len(self.output_queue) > 0:
+                debug_log(DEBUG_DEBUG, "Final check: queue has data, trying one more time")
                 output = self.get_pending_output()
-                debug_log(DEBUG_DEBUG, "After Enter key, got output", 
-                         got_output=bool(output),
-                         output_length=len(output) if output else 0)
             
             if output:
-                debug_log(DEBUG_DEBUG, "Immediate output received", output_length=len(output))
+                debug_log(DEBUG_DEBUG, "Final output collected", output_length=len(output))
                 chunks = [output[i:i+4000] for i in range(0, len(output), 4000)]
                 debug_log(DEBUG_DEBUG, "Sending output in chunks", 
                          total_chunks=len(chunks), total_length=len(output))
@@ -841,14 +902,11 @@ class ClineTelegramBot:
                     text="✅ Response complete"
                 )
             else:
-                debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
-                # Enhanced: Check if queue is being populated by background thread
-                await asyncio.sleep(1)
-                queue_after_wait = len(self.output_queue)
-                debug_log(DEBUG_DEBUG, "Queue after 1 second wait", 
-                         queue_size=queue_after_wait)
-                if queue_after_wait > 0:
-                    debug_log(DEBUG_WARN, "Output appeared after delay - this suggests timing issue")
+                debug_log(DEBUG_WARN, "No output collected after all retries")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="ℹ️ Command sent. If no response appears, Cline might be waiting for input or processing..."
+                )
         else:
             debug_log(DEBUG_WARN, "Command received but session not active", 
                      message_text=message_text, session_active=self.session_active)
