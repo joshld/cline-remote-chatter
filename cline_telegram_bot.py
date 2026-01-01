@@ -74,17 +74,6 @@ class ClineTelegramBot:
         # Application reference for notifications
         self.application = None
         
-        # NEW: Bot state tracking for visual feedback
-        self.bot_state = "idle"  # idle, processing, rate_limited, busy
-        self.last_command_time = 0
-        self.last_output_time = 0
-        self.RATE_LIMIT_SECONDS = 3
-        self.is_sending_output = False
-        
-        # NEW: User notification tracking
-        self.last_user_notification_time = 0
-        self.user_notification_cooldown = 2  # Don't spam user with notifications
-        
         debug_log(DEBUG_DEBUG, "Bot initialized with default state", 
                  master_fd=self.master_fd, slave_fd=self.slave_fd, 
                  is_running=self.is_running, session_active=self.session_active)
@@ -239,12 +228,7 @@ class ClineTelegramBot:
                                  "**Mode Commands:**\n"
                                  "/plan - Switch to plan mode\n"
                                  "/act - Switch to act mode\n"
-                                 "/cancel - Cancel current task\n\n"
-                                 "**Permission Prompts:**\n"
-                                 "When Cline asks for permission to use tools, you can respond with:\n"
-                                 "• `y` or `1` - Yes (default)\n"
-                                 "• `a` or `2` - Yes, and don't ask again\n"
-                                 "• `n` or `3` - No, with feedback"
+                                 "/cancel - Cancel current task"
                         )
                         debug_log(DEBUG_INFO, "Session start notification sent")
                     except Exception as e:
@@ -414,89 +398,59 @@ class ClineTelegramBot:
         """Process incoming output from Cline"""
         clean_output = strip_ansi_codes(output)
         
-        # Only filter out very specific UI elements, not general content
-        # Check for welcome screen (should be filtered)
-        is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
+        # Filter out Cline CLI UI prompts and repetitive UI elements
+        ui_indicators = [
+            '╭', '╰', '│', '┃', '╮', '╯',
+            'cline cli preview',
+            '/plan or /act',
+            'alt+enter',
+            'openrouter/xiaomi',
+            '~/cline-workspace',
+            'enter submit',
+            'new line',
+            'open editor',
+        ]
         
-        # Check for mode switch confirmations (should NOT be filtered)
+        ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
+        lines = clean_output.split('\n')
+        empty_lines = sum(1 for line in lines if not line.strip())
+        
+        is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
+        is_ui_heavy = ui_score >= 2 and not is_welcome_screen
+        is_ui_heavy = is_ui_heavy or (len(lines) > 0 and empty_lines / len(lines) > 0.5)
+        is_box_char = clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯']
+        is_box_line = bool(re.match(r'^[\s│┃╭╰╮╯]+$', clean_output.strip()))
+        
+        api_patterns = [
+            r'## API request completed',
+            r'↑.*↓.*\$',
+            r'Tokens:.*Prompt:.*Completion:',
+            r'Cost:.*\$',
+            r'Elapsed:.*s',
+        ]
+        is_api_metadata = any(re.search(pattern, clean_output, re.IGNORECASE) for pattern in api_patterns)
+        
+        is_command_echo = False
+        if self.current_command:
+            if self.current_command not in ['/plan', '/act']:
+                echo_pattern = r'^[\s│┃]*' + re.escape(self.current_command) + r'[\s│┃]*$'
+                is_command_echo = bool(re.match(echo_pattern, clean_output.strip()))
+        
         is_mode_switch_confirmation = False
         if self.current_command in ['/plan', '/act']:
             mode_indicators = ['switch to plan mode', 'switch to act mode', 'plan mode', 'act mode']
             is_mode_switch_confirmation = any(indicator in clean_output.lower() for indicator in mode_indicators)
         
-        # Check for Cline permission prompts (should NOT be filtered)
-        cline_permission_patterns = [
-            r'Let Cline use this tool\?',
-            r'Allow Cline to use.*tool\?',
-            r'\[act mode\].*Let Cline use',
-            r'\[plan mode\].*Let Cline use',
-        ]
-        is_permission_prompt = any(re.search(pattern, clean_output, re.IGNORECASE) for pattern in cline_permission_patterns)
-        
-        # Only filter if it's purely UI elements with no actual content
-        # Allow box characters if there's meaningful text content
-        lines = clean_output.split('\n')
-        non_empty_lines = [line for line in lines if line.strip()]
-
-        # Check if this is just box characters with no real content
-        is_only_box_chars = len(non_empty_lines) == 0
-        if non_empty_lines:
-            # If we have non-empty lines, check if they contain actual content beyond box chars
-            # A line is considered "only box chars" if it contains only box characters, spaces, and tabs
-            has_real_content = any(
-                re.search(r'[a-zA-Z0-9]', line)  # Contains alphanumeric characters
-                for line in non_empty_lines
-            )
-            if not has_real_content:
-                # No alphanumeric content found, check if it's just UI border characters
-                is_only_box_chars = all(
-                    re.match(r'^[\s│┃╭╰╮╯─]*$', line.strip())
-                    for line in non_empty_lines
-                )
-            else:
-                is_only_box_chars = False
-
-        # Filter only if it's welcome screen or purely decorative UI with no content
-        should_filter = (is_welcome_screen or is_only_box_chars) and not is_mode_switch_confirmation and not is_permission_prompt
-        
-        if should_filter:
+        if not is_welcome_screen and not is_mode_switch_confirmation and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
             if clean_output.strip():
-                debug_log(DEBUG_DEBUG, "Filtered out UI element", 
-                         preview=clean_output[:30].replace('\n', '\\n'),
-                         reason="welcome_screen" if is_welcome_screen else "only_box_chars")
+                debug_log(DEBUG_DEBUG, "Filtered out UI/metadata/echo", 
+                         preview=clean_output[:30].replace('\n', '\\n'))
             return
         
-        if clean_output.strip():
+        if clean_output.strip() and len(clean_output) > 20:
             debug_log(DEBUG_DEBUG, "Queued output", 
-                     preview=clean_output[:50].replace('\n', '\\n'),
-                     line_count=len(non_empty_lines))
+                     preview=clean_output[:50].replace('\n', '\\n'))
 
-        # Cline-specific permission prompts
-        cline_permission_patterns = [
-            r'Let Cline use this tool\?',
-            r'Allow Cline to use.*tool\?',
-            r'\[act mode\].*Let Cline use',
-            r'\[plan mode\].*Let Cline use',
-        ]
-        
-        # Check for Cline permission prompts
-        for pattern in cline_permission_patterns:
-            if re.search(pattern, clean_output, re.IGNORECASE):
-                debug_log(DEBUG_INFO, "Detected Cline permission prompt", 
-                         pattern=pattern, prompt_preview=clean_output[:50])
-                
-                # Set waiting state and store the prompt
-                old_state = self.waiting_for_input
-                self.waiting_for_input = True
-                self.input_prompt = clean_output.strip()
-                
-                debug_log(DEBUG_INFO, "Cline permission prompt detected - waiting for user response", 
-                         old_state=old_state, new_state=self.waiting_for_input)
-                
-                # Add to output queue so user can see the prompt
-                self.output_queue.append(clean_output)
-                return
-        
         prompt_patterns = [
             r'\[y/N\]', r'\[Y/n\]', r'\(y/n\)', r'\(Y/N\)',
             r'Continue\?', r'Proceed\?', r'Are you sure\?',
@@ -663,262 +617,6 @@ class ClineTelegramBot:
         """Check if Cline is waiting for user input"""
         return self.waiting_for_input
 
-    def update_bot_state(self, new_state):
-        """Update bot state and log the change"""
-        old_state = self.bot_state
-        self.bot_state = new_state
-        if old_state != new_state:
-            debug_log(DEBUG_INFO, "Bot state changed", 
-                     old_state=old_state, new_state=new_state)
-
-    def can_send_message_to_user(self):
-        """Check if bot can send messages to user (respecting rate limit)"""
-        current_time = time.time()
-        time_since_last_output = current_time - self.last_output_time
-        
-        if time_since_last_output < self.RATE_LIMIT_SECONDS:
-            return False, self.RATE_LIMIT_SECONDS - time_since_last_output
-        
-        return True, 0
-
-    async def send_user_notification(self, message, force=False):
-        """Send notification to user with rate limiting"""
-        current_time = time.time()
-        
-        # Check cooldown
-        if not force and (current_time - self.last_user_notification_time) < self.user_notification_cooldown:
-            debug_log(DEBUG_DEBUG, "Notification suppressed due to cooldown", 
-                     message_preview=message[:50])
-            return
-        
-        if not self.application:
-            debug_log(DEBUG_WARN, "Cannot send notification - no application reference")
-            return
-        
-        try:
-            await self.application.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=message
-            )
-            self.last_user_notification_time = current_time
-            debug_log(DEBUG_INFO, "User notification sent", message_preview=message[:50])
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send user notification", 
-                     error_type=type(e).__name__, error=str(e))
-
-    async def send_typing_indicator(self):
-        """Send Telegram typing indicator"""
-        if not self.application:
-            return
-        
-        try:
-            await self.application.bot.send_chat_action(
-                chat_id=AUTHORIZED_USER_ID,
-                action="typing"
-            )
-            debug_log(DEBUG_DEBUG, "Typing indicator sent")
-        except Exception as e:
-            debug_log(DEBUG_DEBUG, "Failed to send typing indicator", 
-                     error_type=type(e).__name__, error=str(e))
-
-    async def handle_rate_limited_command(self, update, wait_time):
-        """Handle command sent during rate limiting"""
-        debug_log(DEBUG_INFO, "Rate limited command received", wait_time=wait_time)
-        
-        # Send immediate acknowledgment
-        await update.message.reply_text(
-            f"⏳ **Rate Limited**\n\n"
-            f"Please wait {wait_time:.1f} seconds before sending another command.\n"
-            f"Previous command is still being processed."
-        )
-        
-        # Update bot state
-        self.update_bot_state("rate_limited")
-        
-        # Send typing indicator to show we're still working
-        await self.send_typing_indicator()
-
-    async def handle_processing_command(self, update, command):
-        """Handle command that's being processed"""
-        debug_log(DEBUG_INFO, "Processing command with visual feedback", command=command)
-        
-        # Update state
-        self.update_bot_state("processing")
-        
-        # Send typing indicator
-        await self.send_typing_indicator()
-        
-        # Send processing message if command might take time
-        long_running_keywords = ['run', 'build', 'install', 'download', 'clone', 'test', 'compile']
-        is_long_running = any(keyword in command.lower() for keyword in long_running_keywords)
-        
-        if is_long_running:
-            await update.message.reply_text(
-                f"⚙️ **Processing Command**\n\n"
-                f"Command: `{command}`\n"
-                f"This may take a while. I'll send output as it becomes available..."
-            )
-        else:
-            # For quick commands, just show typing
-            await self.send_typing_indicator()
-
-    async def handle_busy_state(self, update):
-        """Handle when bot is busy with multiple queued operations"""
-        debug_log(DEBUG_INFO, "Bot busy state - user sent message")
-        
-        self.update_bot_state("busy")
-        
-        queue_size = len(self.command_queue)
-        if queue_size > 0:
-            await update.message.reply_text(
-                f"🔄 **Bot Busy**\n\n"
-                f"Your command is queued.\n"
-                f"Position in queue: {queue_size + 1}\n"
-                f"Please wait a moment..."
-            )
-        else:
-            await update.message.reply_text(
-                f"🔄 **Bot Processing**\n\n"
-                f"Working on your previous command.\n"
-                f"Please wait a moment..."
-            )
-        
-        # Send typing to show activity
-        await self.send_typing_indicator()
-
-    async def handle_permission_response(self, response):
-        """Handle user response to Cline permission prompts"""
-        debug_log(DEBUG_INFO, "Handling permission response", response=response)
-        
-        # Map user responses to appropriate actions
-        response_lower = response.lower().strip()
-        
-        try:
-            if response_lower in ['y', 'yes', '1']:
-                # Send "Yes" (first option - default)
-                os.write(self.master_fd, b'\n')
-                debug_log(DEBUG_INFO, "Sent 'Yes' to permission prompt")
-            elif response_lower in ['a', 'always', '2']:
-                # Send down arrow then Enter for "Yes, and don't ask again"
-                os.write(self.master_fd, b'\x1b[B')  # Down arrow
-                time.sleep(0.05)
-                os.write(self.master_fd, b'\n')
-                debug_log(DEBUG_INFO, "Sent 'Yes, and don't ask again' to permission prompt")
-            elif response_lower in ['n', 'no', '3']:
-                # Send down arrow twice then Enter for "No, with feedback"
-                os.write(self.master_fd, b'\x1b[B')  # Down arrow
-                time.sleep(0.05)
-                os.write(self.master_fd, b'\x1b[B')  # Down arrow again
-                time.sleep(0.05)
-                os.write(self.master_fd, b'\n')
-                debug_log(DEBUG_INFO, "Sent 'No, with feedback' to permission prompt")
-            else:
-                # Default: send Enter (selects first option)
-                os.write(self.master_fd, b'\n')
-                debug_log(DEBUG_INFO, "Sent default response to permission prompt")
-            
-            time.sleep(0.2)
-            return True
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send permission response", 
-                     error_type=type(e).__name__, error=str(e))
-            return False
-
-    async def _process_queued_command(self, command, update, context):
-        """Process a queued command without modifying the update object"""
-        debug_log(DEBUG_INFO, "Processing queued command directly", command=command)
-        
-        # Check rate limiting
-        current_time = time.time()
-        time_since_last_output = current_time - self.last_output_time
-        
-        if time_since_last_output < self.RATE_LIMIT_SECONDS:
-            wait_time = self.RATE_LIMIT_SECONDS - time_since_last_output
-            debug_log(DEBUG_INFO, "Queued command rate limited", wait_time=wait_time)
-            await asyncio.sleep(wait_time)
-        
-        # Send visual feedback
-        await self.handle_processing_command(update, command)
-        
-        # Update last command time
-        self.last_command_time = current_time
-        
-        # Send the command
-        result = self.send_command(command)
-        debug_log(DEBUG_DEBUG, "Queued command send result", result=result)
-        
-        # Update state
-        self.update_bot_state("processing")
-        
-        # Collect output with retry logic
-        output = None
-        max_retries = 3
-        retry_delay = 0.4
-        
-        for retry in range(max_retries):
-            queue_size = len(self.output_queue)
-            is_waiting = self.is_waiting_for_input()
-            
-            current_output = self.get_pending_output()
-            
-            if current_output:
-                if not output:
-                    output = current_output
-                else:
-                    output += current_output
-                
-                # If we're not waiting for input, check for more
-                if not is_waiting and retry < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    continue
-                else:
-                    break
-            else:
-                # No output yet
-                if is_waiting and retry == 0:
-                    self.send_enter()
-                    await asyncio.sleep(0.2)
-                    continue
-                
-                # Long-running command check
-                is_long_running = any(keyword in command.lower() for keyword in ['run', 'build', 'install', 'download', 'clone', 'test'])
-                if is_long_running and retry < max_retries - 1:
-                    await asyncio.sleep(0.6)
-                    continue
-                
-                if retry < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-        
-        # Final check
-        if not output and len(self.output_queue) > 0:
-            output = self.get_pending_output()
-        
-        if output:
-            debug_log(DEBUG_DEBUG, "Queued command output collected", output_length=len(output))
-            chunks = [output[i:i+4000] for i in range(0, len(output), 4000)]
-            for i, chunk in enumerate(chunks):
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=chunk
-                )
-            
-            # Update state
-            self.last_output_time = time.time()
-            self.update_bot_state("idle")
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="✅ Queued command complete"
-            )
-        else:
-            debug_log(DEBUG_WARN, "No output from queued command")
-            self.update_bot_state("idle")
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="ℹ️ Queued command sent. No output received."
-            )
-            self.last_output_time = time.time()
-
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming Telegram messages"""
         debug_log(DEBUG_INFO, "handle_message called")
@@ -1046,118 +744,59 @@ class ClineTelegramBot:
                 await update.message.reply_text("❌ No active session. Use /start first")
             return
 
-        # Handle interactive input (including permission prompts)
+        # Handle interactive input
         if self.is_waiting_for_input():
             debug_log(DEBUG_INFO, "Processing interactive input", 
                      waiting_for_input=self.waiting_for_input,
                      prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
             
-            # Check if this is a Cline permission prompt
-            is_permission_prompt = any(pattern in self.input_prompt.lower() for pattern in ['let cline use', 'allow cline'])
+            result = self.send_command(message_text)
+            debug_log(DEBUG_DEBUG, "Interactive input sent", 
+                     input=message_text, result=result)
             
-            if is_permission_prompt:
-                debug_log(DEBUG_INFO, "Handling permission prompt response", 
-                         prompt=self.input_prompt[:50])
-                
-                # Use the permission response handler
-                success = await self.handle_permission_response(message_text)
-                
-                if success:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=f"✅ Permission response sent: `{message_text}`"
-                    )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📤 Input sent: {message_text}"
+            )
+
+            # Enhanced output collection for interactive input
+            output = None
+            for retry in range(3):
+                await asyncio.sleep(0.3)
+                current_output = self.get_pending_output()
+                if current_output:
+                    if not output:
+                        output = current_output
+                    else:
+                        output += current_output
                     
-                    # Clear the waiting state
-                    self.waiting_for_input = False
-                    self.input_prompt = ""
-                    
-                    # Wait a moment and check for any response
-                    await asyncio.sleep(0.5)
-                    output = self.get_pending_output()
-                    
-                    if output:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=output
-                        )
-                else:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="❌ Failed to send permission response"
-                    )
-            else:
-                # Regular interactive input (not a permission prompt)
-                result = self.send_command(message_text)
-                debug_log(DEBUG_DEBUG, "Interactive input sent", 
-                         input=message_text, result=result)
-                
+                    # If we're still waiting for input, continue
+                    if not self.is_waiting_for_input():
+                        break
+            
+            if output:
+                debug_log(DEBUG_DEBUG, "Interactive output received", 
+                         output_length=len(output))
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"📤 Input sent: {message_text}"
+                    text=output
                 )
-
-                # Enhanced output collection for interactive input
-                output = None
-                for retry in range(3):
-                    await asyncio.sleep(0.3)
-                    current_output = self.get_pending_output()
-                    if current_output:
-                        if not output:
-                            output = current_output
-                        else:
-                            output += current_output
-                        
-                        # If we're still waiting for input, continue
-                        if not self.is_waiting_for_input():
-                            break
-                
-                if output:
-                    debug_log(DEBUG_DEBUG, "Interactive output received", 
-                             output_length=len(output))
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="✅ Response complete"
-                    )
-                else:
-                    debug_log(DEBUG_DEBUG, "No output received after interactive input")
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="ℹ️ Input sent. Waiting for response..."
-                    )
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="✅ Response complete"
+                )
+            else:
+                debug_log(DEBUG_DEBUG, "No output received after interactive input")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="ℹ️ Input sent. Waiting for response..."
+                )
             return
 
         # Regular commands
         if self.session_active:
             debug_log(DEBUG_INFO, "Processing regular command", 
                      command=message_text, session_active=self.session_active)
-            
-            # NEW: Check rate limiting and provide visual feedback
-            current_time = time.time()
-            time_since_last_output = current_time - self.last_output_time
-            
-            if time_since_last_output < self.RATE_LIMIT_SECONDS:
-                wait_time = self.RATE_LIMIT_SECONDS - time_since_last_output
-                debug_log(DEBUG_INFO, "Rate limited, sending visual feedback", 
-                         wait_time=wait_time, time_since_last_output=time_since_last_output)
-                
-                await self.handle_rate_limited_command(update, wait_time)
-                
-                # Queue the command for later processing
-                self.command_queue.append(message_text)
-                debug_log(DEBUG_DEBUG, "Command queued due to rate limiting", 
-                         queue_size=len(self.command_queue))
-                return
-            
-            # NEW: Send visual feedback that command is being processed
-            await self.handle_processing_command(update, message_text)
-            
-            # Update last command time
-            self.last_command_time = current_time
             
             # Enhanced debugging: Check state before sending command
             debug_log(DEBUG_DEBUG, "State before command", 
@@ -1171,10 +810,19 @@ class ClineTelegramBot:
                      result=result,
                      queue_size_after_send=len(self.output_queue))
             
-            # Don't send "Command sent" message if we already sent processing feedback
-            # Just update the state
-            self.update_bot_state("processing")
-            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📤 {result}"
+            )
+
+            is_long_running = any(keyword in message_text.lower() for keyword in ['run', 'build', 'install', 'download', 'clone'])
+            if is_long_running:
+                debug_log(DEBUG_INFO, "Long-running task detected", command=message_text)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⏳ Long-running task started. Output will be sent as it becomes available..."
+                )
+
             # Enhanced output collection with retry logic
             output = None
             max_retries = 3
@@ -1249,50 +897,16 @@ class ClineTelegramBot:
                     )
                     debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
                 
-                # Update last output time and state
-                self.last_output_time = time.time()
-                self.update_bot_state("idle")
-                
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="✅ Response complete"
                 )
-                
-                # NEW: Check if there are queued commands
-                if len(self.command_queue) > 0:
-                    debug_log(DEBUG_INFO, "Processing queued commands", 
-                             queue_size=len(self.command_queue))
-                    await asyncio.sleep(1)  # Brief pause before queued commands
-                    
-                    # Process queued commands one by one
-                    while len(self.command_queue) > 0:
-                        queued_command = self.command_queue.popleft()
-                        debug_log(DEBUG_INFO, "Processing queued command", 
-                                 command=queued_command, remaining=len(self.command_queue))
-                        
-                        # Send queued command notification
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"🔄 **Processing Queued Command**\n\n`{queued_command}`"
-                        )
-                        
-                        # Process the queued command directly instead of recursive call
-                        await self._process_queued_command(queued_command, update, context)
-                        
-                        # Brief pause between queued commands
-                        if len(self.command_queue) > 0:
-                            await asyncio.sleep(1)
             else:
                 debug_log(DEBUG_WARN, "No output collected after all retries")
-                self.update_bot_state("idle")
-                
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="ℹ️ Command sent. If no response appears, Cline might be waiting for input or processing..."
                 )
-                
-                # Update last output time to prevent immediate rate limiting
-                self.last_output_time = time.time()
         else:
             debug_log(DEBUG_WARN, "Command received but session not active", 
                      message_text=message_text, session_active=self.session_active)
@@ -1302,25 +916,22 @@ async def output_monitor(bot_instance, application):
     """Monitor for new output and send to user"""
     debug_log(DEBUG_INFO, "Output monitor started")
     iteration_count = 0
+    last_send_time = 0
+    RATE_LIMIT_SECONDS = 3
     
     while True:
         iteration_count += 1
         if iteration_count % 30 == 0:
             debug_log(DEBUG_DEBUG, "Output monitor heartbeat", iterations=iteration_count)
         
-        # Only process output if bot is not currently handling a command
-        # This prevents conflicts with the new visual feedback system
-        if (bot_instance.session_active and 
-            bot_instance.output_queue and 
-            bot_instance.bot_state in ["idle", "processing"]):
-            
+        if bot_instance.session_active and bot_instance.output_queue:
             debug_log(DEBUG_DEBUG, "Output monitor found data", 
                      queue_size=len(bot_instance.output_queue))
             
-            # Check if we can send (respect rate limiting)
-            can_send, wait_time = bot_instance.can_send_message_to_user()
-            if not can_send:
-                debug_log(DEBUG_DEBUG, "Rate limited in monitor, waiting", wait_time=wait_time)
+            current_time = time.time()
+            if current_time - last_send_time < RATE_LIMIT_SECONDS:
+                debug_log(DEBUG_DEBUG, "Rate limited, waiting", 
+                         time_since_last_send=current_time - last_send_time)
                 await asyncio.sleep(0.5)
                 continue
             
@@ -1328,55 +939,26 @@ async def output_monitor(bot_instance, application):
             if output:
                 clean_output = strip_ansi_codes(output)
                 
-                # Filter UI elements using the same logic as _process_output
                 is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
+                ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
+                ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
                 
-                # Use the same robust filtering logic
-                lines = clean_output.split('\n')
-                non_empty_lines = [line for line in lines if line.strip()]
-                
-                # Check if this is just box characters with no real content
-                is_only_box_chars = len(non_empty_lines) == 0
-                if non_empty_lines:
-                    # Check if lines contain only box characters and spaces
-                    has_real_content = any(
-                        re.search(r'[a-zA-Z0-9]', line)
-                        for line in non_empty_lines
-                    )
-                    if not has_real_content:
-                        is_only_box_chars = all(
-                            re.match(r'^[\s│┃╭╰╮╯─]*$', line.strip())
-                            for line in non_empty_lines
-                        )
-                    else:
-                        is_only_box_chars = False
-                
-                should_filter = is_welcome_screen or is_only_box_chars
-                
-                if should_filter:
+                if ui_score >= 2 and not is_welcome_screen:
                     debug_log(DEBUG_DEBUG, "Filtered UI from monitor output", 
-                             preview=clean_output[:30].replace('\n', '\\n'),
-                             reason="welcome_screen" if is_welcome_screen else "only_box_chars")
+                             ui_score=ui_score, output_length=len(clean_output))
                     continue
                 
-                # Don't send if we're in rate_limited or busy state
-                if bot_instance.bot_state in ["rate_limited", "busy"]:
-                    debug_log(DEBUG_DEBUG, "Skipping output due to bot state", 
-                             state=bot_instance.bot_state)
-                    continue
-                
-                debug_log(DEBUG_INFO, "Sending output to user via monitor", 
+                debug_log(DEBUG_INFO, "Sending output to user", 
                          output_length=len(clean_output))
                 try:
                     await application.bot.send_message(
                         chat_id=AUTHORIZED_USER_ID,
                         text=clean_output
                     )
-                    # Update last output time
-                    bot_instance.last_output_time = time.time()
-                    debug_log(DEBUG_DEBUG, "Output sent successfully via monitor")
+                    last_send_time = current_time
+                    debug_log(DEBUG_DEBUG, "Output sent successfully")
                 except Exception as e:
-                    debug_log(DEBUG_ERROR, "Error sending output via monitor", 
+                    debug_log(DEBUG_ERROR, "Error sending output", 
                              error_type=type(e).__name__, error=str(e))
             else:
                 debug_log(DEBUG_DEBUG, "No output after get_pending_output")
@@ -1385,9 +967,6 @@ async def output_monitor(bot_instance, application):
                 debug_log(DEBUG_DEBUG, "Output monitor: session not active")
             elif not bot_instance.output_queue:
                 debug_log(DEBUG_DEBUG, "Output monitor: queue empty")
-            elif bot_instance.bot_state not in ["idle", "processing"]:
-                debug_log(DEBUG_DEBUG, "Output monitor: bot not in idle/processing state", 
-                         state=bot_instance.bot_state)
 
         await asyncio.sleep(2)
 
@@ -1451,15 +1030,9 @@ def main():
                      "• PTY session management ready\n"
                      "• Background output monitoring active\n"
                      "• Interactive command support enabled\n\n"
-                     "**Basic Commands:**\n"
-                     "/start - Begin a Cline session\n"
-                     "/status - Check bot status\n"
-                     "/stop - End session\n\n"
-                     "**Permission Prompts:**\n"
-                     "When Cline asks for permission to use tools, respond with:\n"
-                     "• `y` or `1` - Yes (default)\n"
-                     "• `a` or `2` - Yes, and don't ask again\n"
-                     "• `n` or `3` - No, with feedback"
+                     "Use /start to begin a Cline session\n"
+                     "Use /status to check bot status\n"
+                     "Use /stop to end session"
             )
             debug_log(DEBUG_INFO, "Startup notification sent")
         except Exception as e:
