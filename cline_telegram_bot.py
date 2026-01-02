@@ -60,7 +60,6 @@ class ClineTelegramBot:
         self.stop_reading = False
 
         # Command handling
-        self.command_queue = deque()
         self.current_command = None
         self.waiting_for_input = False
         self.input_prompt = ""
@@ -359,7 +358,6 @@ class ClineTelegramBot:
         
         # Clear queues
         self.output_queue.clear()
-        self.command_queue.clear()
         
         debug_log(DEBUG_DEBUG, "Cleanup complete")
 
@@ -424,20 +422,7 @@ class ClineTelegramBot:
         is_box_char = clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯']
         is_box_line = bool(re.match(r'^[\s│┃╭╰╮╯]+$', clean_output.strip()))
         
-        api_patterns = [
-            r'## API request completed',
-            r'↑.*↓.*\$',
-            r'Tokens:.*Prompt:.*Completion:',
-            r'Cost:.*\$',
-            r'Elapsed:.*s',
-        ]
-        is_api_metadata = any(re.search(pattern, clean_output, re.IGNORECASE) for pattern in api_patterns)
-        
-        is_command_echo = False
-        if self.current_command:
-            if self.current_command not in ['/plan', '/act']:
-                echo_pattern = r'^[\s│┃]*' + re.escape(self.current_command) + r'[\s│┃]*$'
-                is_command_echo = bool(re.match(echo_pattern, clean_output.strip()))
+        # Removed unused api_patterns, is_api_metadata, and is_command_echo variables
         
         is_mode_switch_confirmation = False
         if self.current_command in ['/plan', '/act']:
@@ -774,12 +759,6 @@ class ClineTelegramBot:
                     chat_id=update.effective_chat.id,
                     text=output
                 )
-                '''
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ Response complete"
-                )
-                '''
             else:
                 debug_log(DEBUG_DEBUG, "No output received after interactive input")
             return
@@ -932,12 +911,10 @@ async def output_monitor(bot_instance, application, chat_id):
                         if ui_hash not in recent_messages:
                             debug_log(DEBUG_INFO, f"Sending immediate UI status: {ui_message}")
                             try:
-                                '''
                                 await application.bot.send_message(
                                     chat_id=chat_id,
                                     text=f"💬 {ui_message}"
                                 )
-                                '''
                                 # Add to recent messages to prevent repeats
                                 recent_messages.add(ui_hash)
                                 if len(recent_messages) > MAX_RECENT_MESSAGES:
