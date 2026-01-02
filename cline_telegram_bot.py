@@ -64,6 +64,7 @@ class ClineTelegramBot:
         self.current_command = None
         self.waiting_for_input = False
         self.input_prompt = ""
+        self.last_prompt_time = 0
 
         # Session state
         self.session_active = False
@@ -73,6 +74,8 @@ class ClineTelegramBot:
         
         # Application reference for notifications
         self.application = None
+
+        self.last_chat_id = None
         
         debug_log(DEBUG_DEBUG, "Bot initialized with default state", 
                  master_fd=self.master_fd, slave_fd=self.slave_fd, 
@@ -441,15 +444,15 @@ class ClineTelegramBot:
             mode_indicators = ['switch to plan mode', 'switch to act mode', 'plan mode', 'act mode']
             is_mode_switch_confirmation = any(indicator in clean_output.lower() for indicator in mode_indicators)
         
-        if not is_welcome_screen and not is_mode_switch_confirmation and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
+        is_mostly_empty_ui = (is_box_char or is_box_line) and len(clean_output.strip()) <= 3
+
+        if not is_welcome_screen and not is_mode_switch_confirmation and is_mostly_empty_ui:
             if clean_output.strip():
-                debug_log(DEBUG_DEBUG, "Filtered out UI/metadata/echo", 
-                         preview=clean_output[:30].replace('\n', '\\n'))
+                debug_log(DEBUG_DEBUG, f"Filtered out pure UI: {clean_output.replace(chr(10), '\\n')}")
             return
         
-        if clean_output.strip() and len(clean_output) > 20:
-            debug_log(DEBUG_DEBUG, "Queued output", 
-                     preview=clean_output[:50].replace('\n', '\\n'))
+        if clean_output.strip():
+            debug_log(DEBUG_DEBUG, f"Queued output: {clean_output.replace(chr(10), '\\n')}")
 
         prompt_patterns = [
             r'\[y/N\]', r'\[Y/n\]', r'\(y/n\)', r'\(Y/N\)',
@@ -458,8 +461,8 @@ class ClineTelegramBot:
             r'Press.*Enter.*to.*continue',
             r'Press.*any.*key',
             r'\[.*\]\s*$',
-            r'Press.*to.*exit',
-            r'Press.*to.*return',
+            r'Press .*to exit',
+            r'Press .* to return', 
         ]
 
         prompt_detected = False
@@ -468,6 +471,7 @@ class ClineTelegramBot:
                 old_state = self.waiting_for_input
                 self.waiting_for_input = True
                 self.input_prompt = clean_output.strip()
+                self.last_prompt_time = time.time()
                 prompt_detected = True
                 debug_log(DEBUG_INFO, "Interactive prompt detected", 
                          pattern=pattern, prompt=self.input_prompt[:50],
@@ -504,6 +508,14 @@ class ClineTelegramBot:
             debug_log(DEBUG_ERROR, "Cannot send command - PTY not running")
             return "Error: PTY session not running"
 
+        # Reset stale waiting state (if waiting for more than 30 seconds)
+        current_time = time.time()
+        if self.waiting_for_input and hasattr(self, 'last_prompt_time') and (current_time - self.last_prompt_time) > 30:
+            debug_log(DEBUG_INFO, "Resetting stale waiting_for_input state", 
+                     time_since_prompt=current_time - self.last_prompt_time)
+            self.waiting_for_input = False
+            self.input_prompt = ""
+
         try:
             # CRITICAL FIX: Reset input state BEFORE sending command
             old_waiting = self.waiting_for_input
@@ -514,28 +526,14 @@ class ClineTelegramBot:
                      old_waiting=old_waiting, old_prompt_preview=old_prompt[:30] if old_prompt else None,
                      new_waiting=self.waiting_for_input)
 
-            submission_methods = [
-                f"{command}\n",
-                f"{command}\r",
-                f"{command}\r\n",
-                f"{command}\x04",
-            ]
-            
-            for i, method in enumerate(submission_methods):
-                debug_log(DEBUG_DEBUG, f"Trying submission method {i+1}", 
-                         method_repr=repr(method), method_num=i+1)
-                
-                command_bytes = method.encode()
-                bytes_written = os.write(self.master_fd, command_bytes)
-                debug_log(DEBUG_DEBUG, f"Method {i+1} bytes written", 
-                         bytes_written=bytes_written, expected=len(command_bytes))
-                
-                time.sleep(0.3)
-                
-                if len(self.output_queue) > 0:
-                    debug_log(DEBUG_INFO, f"Success with method {i+1}", method_num=i+1)
-                    break
-            
+            command_with_newline = f"{command}\r\n"
+            command_bytes = command_with_newline.encode()
+            bytes_written = os.write(self.master_fd, command_bytes)
+            debug_log(DEBUG_DEBUG, "Command sent with newline", 
+                    bytes_written=bytes_written, expected=len(command_bytes))
+
+            time.sleep(0.2)
+
             self.current_command = command
             
             if self.process:
@@ -632,6 +630,11 @@ class ClineTelegramBot:
 
         debug_log(DEBUG_DEBUG, "Authorized user message", message_text=message_text)
 
+        self.last_chat_id = update.effective_chat.id
+        debug_log(DEBUG_DEBUG, "Chat ID set", 
+                last_chat_id=self.last_chat_id, 
+                effective_chat_id=update.effective_chat.id)
+
         # Special commands
         if message_text == "/start":
             debug_log(DEBUG_INFO, "Processing /start command", 
@@ -640,6 +643,15 @@ class ClineTelegramBot:
                 if self.start_pty_session(self.application):
                     debug_log(DEBUG_INFO, "/start: Session started successfully")
                     await update.message.reply_text("✅ Cline session started\n\n**Bot Commands:**\n• Natural language: `show me the current directory`\n• CLI commands: `git status`, `ls`\n• `/plan` - Switch Cline to plan mode\n• `/act` - Switch Cline to act mode\n• `/cancel` - Cancel current task\n• `/status` - Check status\n• `/stop` - End session")
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if not hasattr(self, '_output_monitor_started'):
+                            loop.create_task(output_monitor(self, self.application, self.last_chat_id))
+                            self._output_monitor_started = True
+                            debug_log(DEBUG_DEBUG, "Output monitor task created for session")
+                    except Exception as e:
+                        debug_log(DEBUG_ERROR, "Failed to create output monitor task", 
+                                error_type=type(e).__name__, error=str(e))
                 else:
                     debug_log(DEBUG_ERROR, "/start: Failed to start session")
                     await update.message.reply_text("❌ Failed to start Cline session")
@@ -762,10 +774,12 @@ class ClineTelegramBot:
                     chat_id=update.effective_chat.id,
                     text=output
                 )
+                '''
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="✅ Response complete"
                 )
+                '''
             else:
                 debug_log(DEBUG_DEBUG, "No output received after interactive input")
             return
@@ -800,7 +814,7 @@ class ClineTelegramBot:
                     text="⏳ Long-running task started. Output will be sent as it becomes available..."
                 )
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0)
             
             # Enhanced debugging: Check state before getting output
             debug_log(DEBUG_DEBUG, "Before get_pending_output", 
@@ -836,10 +850,12 @@ class ClineTelegramBot:
                     )
                     debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
                 
+                '''
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="✅ Response complete"
                 )
+                '''
             else:
                 debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
                 # Enhanced: Check if queue is being populated by background thread
@@ -854,12 +870,15 @@ class ClineTelegramBot:
                      message_text=message_text, session_active=self.session_active)
             await update.message.reply_text("❌ Cline session not running. Use /start first")
 
-async def output_monitor(bot_instance, application):
+async def output_monitor(bot_instance, application, chat_id):
     """Monitor for new output and send to user"""
     debug_log(DEBUG_INFO, "Output monitor started")
     iteration_count = 0
     last_send_time = 0
-    RATE_LIMIT_SECONDS = 3
+
+    # Initialize deduplication tracking
+    recent_messages = set()
+    MAX_RECENT_MESSAGES = 10
     
     while True:
         iteration_count += 1
@@ -871,37 +890,133 @@ async def output_monitor(bot_instance, application):
                      queue_size=len(bot_instance.output_queue))
             
             current_time = time.time()
-            if current_time - last_send_time < RATE_LIMIT_SECONDS:
-                debug_log(DEBUG_DEBUG, "Rate limited, waiting", 
-                         time_since_last_send=current_time - last_send_time)
-                await asyncio.sleep(0.5)
-                continue
             
             output = bot_instance.get_pending_output()
             if output:
+                # DEBUG: Log raw output from Cline
+                debug_log(DEBUG_DEBUG, f"RAW CLINE OUTPUT: {repr(output)}")
                 clean_output = strip_ansi_codes(output)
+
+                clean_lines = clean_output.split('\n')
+                clean_lines = list(dict.fromkeys(line.strip() for line in clean_lines))
+                clean_output = '\n'.join(clean_lines)
                 
-                is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-                ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
-                ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
+                # DEBUG: Log cleaned output  
+                debug_log(DEBUG_DEBUG, f"CLEAN CLINE OUTPUT: {repr(clean_output)}")
+
+                lines = clean_output.split('\n')
+                # Deduplicate while preserving original formatting
+                seen = set()
+                deduplicated_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped not in seen:
+                        seen.add(stripped)
+                        deduplicated_lines.append(line)  # Keep original formatting
+                lines = deduplicated_lines
+                ui_status_lines = []
+                other_lines = []
+
+                for line in lines:
+                    if line.strip().startswith('┃') and len(line.strip()) > 5:
+                        ui_status_lines.append(line)
+                    else:
+                        other_lines.append(line)
                 
-                if ui_score >= 2 and not is_welcome_screen:
-                    debug_log(DEBUG_DEBUG, "Filtered UI from monitor output", 
-                             ui_score=ui_score, output_length=len(clean_output))
-                    continue
+                # Send UI status lines immediately
+                for ui_line in ui_status_lines:
+                    ui_message = ui_line.strip()
+                    if ui_message and len(ui_message) > 3:  # Not just "┃"
+                        # Check if this UI message was already sent
+                        ui_hash = hash(ui_message)
+                        if ui_hash not in recent_messages:
+                            debug_log(DEBUG_INFO, f"Sending immediate UI status: {ui_message}")
+                            try:
+                                '''
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"💬 {ui_message}"
+                                )
+                                '''
+                                # Add to recent messages to prevent repeats
+                                recent_messages.add(ui_hash)
+                                if len(recent_messages) > MAX_RECENT_MESSAGES:
+                                    recent_messages.pop()
+                            except Exception as e:
+                                debug_log(DEBUG_ERROR, "Failed to send UI status", error=str(e))
+                        else:
+                            debug_log(DEBUG_DEBUG, f"Skipping duplicate UI status: {ui_message}")
                 
-                debug_log(DEBUG_INFO, "Sending output to user", 
-                         output_length=len(clean_output))
-                try:
-                    await application.bot.send_message(
-                        chat_id=AUTHORIZED_USER_ID,
-                        text=clean_output
-                    )
-                    last_send_time = current_time
-                    debug_log(DEBUG_DEBUG, "Output sent successfully")
-                except Exception as e:
-                    debug_log(DEBUG_ERROR, "Error sending output", 
-                             error_type=type(e).__name__, error=str(e))
+                # Process remaining output normally
+                remaining_output = '\n'.join(other_lines).strip()
+
+                # Deduplicate remaining output lines
+                remaining_lines = remaining_output.split('\n')
+                debug_log(DEBUG_DEBUG, f"BEFORE dedup: {len(remaining_lines)} lines")
+                for i, line in enumerate(remaining_lines):
+                    debug_log(DEBUG_DEBUG, f"Line {i}: '{line}' -> stripped: '{line.strip()}'")
+                seen = set()
+                deduplicated_lines = []
+                for line in remaining_lines:
+                    stripped = line.strip()
+                    if stripped not in seen:
+                        seen.add(stripped)
+                        deduplicated_lines.append(line)  # Keep original formatting
+                    else:
+                        debug_log(DEBUG_DEBUG, f"REMOVED DUPLICATE: '{stripped}'")
+                remaining_output = '\n'.join(deduplicated_lines)
+                debug_log(DEBUG_DEBUG, f"AFTER dedup: {len(deduplicated_lines)} lines")
+
+                if remaining_output:
+                    # Use REMAINING_OUTPUT for filtering (not clean_output)
+                    is_welcome_screen = 'cline cli' in remaining_output
+                    ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
+                    ui_score = sum(1 for indicator in ui_indicators if indicator in remaining_output)
+                    
+                    # All other filtering logic uses remaining_output
+                    normalized_output = ' '.join(remaining_output.split())
+                    message_hash = hash(normalized_output)  # ADD THIS LINE
+                    is_repetitive_ui = ui_score >= 2 and '/plan or /act' in remaining_output
+                    is_duplicate = message_hash in recent_messages  # Now defined
+                    is_cline_response = '###' in remaining_output
+
+                    should_filter = False
+
+                    if is_duplicate:
+                        should_filter = True
+                    elif is_cline_response:
+                        should_filter = False  # Allow Cline responses
+                    elif '/plan or /act to switch modes' in remaining_output and ui_score >= 1:  # FIX: use remaining_output
+                        should_filter = True  # Repetitive spam
+                    elif ui_score >= 2 and len(remaining_output.strip()) <= 50:
+                        should_filter = True  # Short UI junk
+                    # Allow all messages with '###' (Cline responses)
+
+                    if should_filter:
+                        debug_log(DEBUG_DEBUG, "Filtered message", 
+                                content=clean_output[:200].replace('\n', '\\n'),
+                                ui_score=ui_score, 
+                                output_length=len(clean_output),
+                                is_duplicate=is_duplicate)
+                        if '/plan or /act' in clean_output:  # Add repetitive messages to dedup list
+                            recent_messages.add(normalized_output)
+                            if len(recent_messages) > MAX_RECENT_MESSAGES:
+                                recent_messages.pop()
+                        continue
+                    
+                    debug_log(DEBUG_INFO, f"Sending output to user: {clean_output.replace(chr(10), '\\n')}", 
+                        output_length=len(clean_output),
+                        chat_id=chat_id)
+                    try:
+                        await application.bot.send_message(
+                            chat_id=chat_id,
+                            text=clean_output
+                        )
+                        last_send_time = current_time
+                        debug_log(DEBUG_DEBUG, "Output sent successfully")
+                    except Exception as e:
+                        debug_log(DEBUG_ERROR, "Error sending output", 
+                                error_type=type(e).__name__, error=str(e))
             else:
                 debug_log(DEBUG_DEBUG, "No output after get_pending_output")
         else:
@@ -955,8 +1070,6 @@ def main():
 
     try:
         loop = asyncio.get_event_loop()
-        loop.create_task(output_monitor(bot, application))
-        debug_log(DEBUG_DEBUG, "Output monitor task created")
     except Exception as e:
         debug_log(DEBUG_ERROR, "Failed to create output monitor task", 
                  error_type=type(e).__name__, error=str(e))
