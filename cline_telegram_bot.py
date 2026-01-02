@@ -589,6 +589,39 @@ class ClineTelegramBot:
         """Check if Cline is waiting for user input"""
         return self.waiting_for_input
 
+    async def _ensure_session_active(self, update: Update) -> bool:
+        """Check if session is active, send error message if not. Returns True if active."""
+        if not self.session_active:
+            await update.message.reply_text("❌ No active session. Use /start first")
+            return False
+        return True
+
+    async def _execute_command_and_respond(self, command: str, update: Update, context: ContextTypes.DEFAULT_TYPE, sleep_time: float = 0.5):
+        """Execute a command, wait, and send any response back to user."""
+        result = self.send_command(command)
+        debug_log(DEBUG_DEBUG, "Command sent", command=command, result=result)
+
+        await asyncio.sleep(sleep_time)
+
+        output = self.get_pending_output()
+        if output:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=output
+            )
+
+    async def _send_notification(self, chat_id: int, message: str, success_log: str, error_log: str):
+        """Send a notification message with standardized error handling."""
+        try:
+            await self.application.bot.send_message(
+                chat_id=chat_id,
+                text=message
+            )
+            debug_log(DEBUG_INFO, success_log)
+        except Exception as e:
+            debug_log(DEBUG_ERROR, error_log,
+                     error_type=type(e).__name__, error=str(e))
+
     async def _handle_start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         debug_log(DEBUG_INFO, "Processing /start command",
@@ -633,24 +666,15 @@ class ClineTelegramBot:
     async def _handle_cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /cancel command"""
         debug_log(DEBUG_INFO, "Processing /cancel command")
-        if self.session_active:
-            result = self.send_command("\x03")
-            debug_log(DEBUG_DEBUG, "Cancel signal sent", result=result)
+        if not await self._ensure_session_active(update):
+            return
 
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="🛑 Cancel signal sent to Cline"
-            )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🛑 Cancel signal sent to Cline"
+        )
 
-            await asyncio.sleep(0.5)
-            output = self.get_pending_output()
-            if output:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=output
-                )
-        else:
-            await update.message.reply_text("❌ No active session to cancel")
+        await self._execute_command_and_respond("\x03", update, context, sleep_time=0.5)
 
     async def _handle_mode_switch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /plan and /act commands"""
@@ -658,24 +682,16 @@ class ClineTelegramBot:
         mode = command[1:]  # Remove the /
         debug_log(DEBUG_INFO, f"Processing {command} command")
 
-        if self.session_active:
-            result = self.send_command(command)
-            debug_log(DEBUG_DEBUG, f"{mode.title()} mode switch sent", result=result)
+        if not await self._ensure_session_active(update):
+            return
 
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"📋 Switched Cline to **{mode.upper()} MODE**"
-            )
+        debug_log(DEBUG_DEBUG, f"{mode.title()} mode switch initiated")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"📋 Switched Cline to **{mode.upper()} MODE**"
+        )
 
-            await asyncio.sleep(0.5)
-            output = self.get_pending_output()
-            if output:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=output
-                )
-        else:
-            await update.message.reply_text(f"❌ No active session. Use /start first")
+        await self._execute_command_and_respond(command, update, context, sleep_time=0.5)
 
     async def _handle_regular_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle regular user messages (not commands)"""
@@ -1137,7 +1153,7 @@ def main():
             )
             debug_log(DEBUG_INFO, "Startup notification sent")
         except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send startup notification", 
+            debug_log(DEBUG_ERROR, "Failed to send startup notification",
                      error_type=type(e).__name__, error=str(e))
 
     async def send_shutdown_notification():
