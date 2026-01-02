@@ -589,6 +589,183 @@ class ClineTelegramBot:
         """Check if Cline is waiting for user input"""
         return self.waiting_for_input
 
+    async def _handle_start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        debug_log(DEBUG_INFO, "Processing /start command",
+                 session_active=self.session_active)
+        if not self.session_active:
+            if self.start_pty_session(self.application):
+                debug_log(DEBUG_INFO, "/start: Session started successfully")
+                await update.message.reply_text("✅ Cline session started\n\n**Bot Commands:**\n• Natural language: `show me the current directory`\n• CLI commands: `git status`, `ls`\n• `/plan` - Switch Cline to plan mode\n• `/act` - Switch Cline to act mode\n• `/cancel` - Cancel current task\n• `/status` - Check status\n• `/stop` - End session")
+                try:
+                    loop = asyncio.get_running_loop()
+                    if not hasattr(self, '_output_monitor_started'):
+                        loop.create_task(output_monitor(self, self.application, self.last_chat_id))
+                        self._output_monitor_started = True
+                        debug_log(DEBUG_DEBUG, "Output monitor task created for session")
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, "Failed to create output monitor task",
+                            error_type=type(e).__name__, error=str(e))
+            else:
+                debug_log(DEBUG_ERROR, "/start: Failed to start session")
+                await update.message.reply_text("❌ Failed to start Cline session")
+        else:
+            debug_log(DEBUG_INFO, "/start: Session already running")
+            await update.message.reply_text("ℹ️ Cline session already running")
+
+    async def _handle_stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /stop command"""
+        debug_log(DEBUG_INFO, "Processing /stop command")
+        self.stop_pty_session(self.application)
+        await update.message.reply_text("🛑 Cline session stopped")
+
+    async def _handle_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /status command"""
+        debug_log(DEBUG_INFO, "Processing /status command")
+        status = "🟢 Running" if self.session_active else "🔴 Stopped"
+        waiting = " (waiting for input)" if self.is_waiting_for_input() else ""
+        debug_log(DEBUG_DEBUG, "Status check",
+                 session_active=self.session_active,
+                 waiting_for_input=self.is_waiting_for_input(),
+                 status=status)
+        await update.message.reply_text(f"Status: {status}{waiting}")
+
+    async def _handle_cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cancel command"""
+        debug_log(DEBUG_INFO, "Processing /cancel command")
+        if self.session_active:
+            result = self.send_command("\x03")
+            debug_log(DEBUG_DEBUG, "Cancel signal sent", result=result)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="🛑 Cancel signal sent to Cline"
+            )
+
+            await asyncio.sleep(0.5)
+            output = self.get_pending_output()
+            if output:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=output
+                )
+        else:
+            await update.message.reply_text("❌ No active session to cancel")
+
+    async def _handle_mode_switch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /plan and /act commands"""
+        command = update.message.text
+        mode = command[1:]  # Remove the /
+        debug_log(DEBUG_INFO, f"Processing {command} command")
+
+        if self.session_active:
+            result = self.send_command(command)
+            debug_log(DEBUG_DEBUG, f"{mode.title()} mode switch sent", result=result)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📋 Switched Cline to **{mode.upper()} MODE**"
+            )
+
+            await asyncio.sleep(0.5)
+            output = self.get_pending_output()
+            if output:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=output
+                )
+        else:
+            await update.message.reply_text(f"❌ No active session. Use /start first")
+
+    async def _handle_regular_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle regular user messages (not commands)"""
+        message_text = update.message.text.strip()
+
+        # Handle interactive input
+        if self.is_waiting_for_input():
+            debug_log(DEBUG_INFO, "Processing interactive input",
+                     prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
+
+            result = self.send_command(message_text)
+            debug_log(DEBUG_DEBUG, "Interactive input sent", input=message_text, result=result)
+
+            await asyncio.sleep(0.5)
+            output = self.get_pending_output()
+            if output:
+                debug_log(DEBUG_DEBUG, "Interactive output received", output_length=len(output))
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=output
+                )
+            else:
+                debug_log(DEBUG_DEBUG, "No output received after interactive input")
+            return
+
+        # Regular commands (PTY-based)
+        if self.session_active:
+            debug_log(DEBUG_INFO, "Processing regular command",
+                     command=message_text, session_active=self.session_active)
+
+            debug_log(DEBUG_DEBUG, "State before command",
+                     waiting_for_input=self.waiting_for_input,
+                     queue_size_before=len(self.output_queue),
+                     current_command=self.current_command)
+
+            result = self.send_command(message_text)
+
+            debug_log(DEBUG_DEBUG, "Command send result",
+                     result=result,
+                     queue_size_after_send=len(self.output_queue))
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📤 Message sent: {message_text}"
+            )
+
+            await asyncio.sleep(2.0)
+
+            debug_log(DEBUG_DEBUG, "Before get_pending_output",
+                     queue_size=len(self.output_queue),
+                     waiting_for_input=self.is_waiting_for_input())
+
+            output = self.get_pending_output()
+
+            debug_log(DEBUG_DEBUG, "After get_pending_output",
+                     got_output=bool(output),
+                     output_length=len(output) if output else 0,
+                     waiting_for_input_after=self.is_waiting_for_input(),
+                     queue_size_after=len(self.output_queue))
+
+            if not output and self.is_waiting_for_input():
+                debug_log(DEBUG_INFO, "No immediate output, waiting for Cline response...")
+
+                await asyncio.sleep(0.3)
+                output = self.get_pending_output()
+                debug_log(DEBUG_DEBUG, "After Enter key, got output",
+                         got_output=bool(output),
+                         output_length=len(output) if output else 0)
+
+                if not output:
+                    await asyncio.sleep(1)
+                    queue_after_wait = len(self.output_queue)
+                    debug_log(DEBUG_DEBUG, "Queue after 1 second wait",
+                             queue_size=queue_after_wait)
+                    if queue_after_wait > 0:
+                        output = self.get_pending_output()
+
+            if output:
+                debug_log(DEBUG_INFO, "Interactive output received", output_length=len(output))
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=output
+                )
+            else:
+                debug_log(DEBUG_WARN, "No output received after command")
+        else:
+            debug_log(DEBUG_WARN, "Command received but session not active",
+                     message_text=message_text, session_active=self.session_active)
+            await update.message.reply_text("❌ Cline session not running. Use /start first")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming Telegram messages"""
         debug_log(DEBUG_INFO, "handle_message called")
@@ -615,120 +792,23 @@ class ClineTelegramBot:
                 last_chat_id=self.last_chat_id, 
                 effective_chat_id=update.effective_chat.id)
 
-        # Special commands
-        if message_text == "/start":
-            debug_log(DEBUG_INFO, "Processing /start command", 
-                     session_active=self.session_active)
-            if not self.session_active:
-                if self.start_pty_session(self.application):
-                    debug_log(DEBUG_INFO, "/start: Session started successfully")
-                    await update.message.reply_text("✅ Cline session started\n\n**Bot Commands:**\n• Natural language: `show me the current directory`\n• CLI commands: `git status`, `ls`\n• `/plan` - Switch Cline to plan mode\n• `/act` - Switch Cline to act mode\n• `/cancel` - Cancel current task\n• `/status` - Check status\n• `/stop` - End session")
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if not hasattr(self, '_output_monitor_started'):
-                            loop.create_task(output_monitor(self, self.application, self.last_chat_id))
-                            self._output_monitor_started = True
-                            debug_log(DEBUG_DEBUG, "Output monitor task created for session")
-                    except Exception as e:
-                        debug_log(DEBUG_ERROR, "Failed to create output monitor task", 
-                                error_type=type(e).__name__, error=str(e))
-                else:
-                    debug_log(DEBUG_ERROR, "/start: Failed to start session")
-                    await update.message.reply_text("❌ Failed to start Cline session")
-            else:
-                debug_log(DEBUG_INFO, "/start: Session already running")
-                await update.message.reply_text("ℹ️ Cline session already running")
+        # Command dispatch
+        COMMAND_HANDLERS = {
+            "/start": self._handle_start_command,
+            "/stop": self._handle_stop_command,
+            "/status": self._handle_status_command,
+            "/cancel": self._handle_cancel_command,
+            "/plan": self._handle_mode_switch_command,
+            "/act": self._handle_mode_switch_command
+        }
+
+        handler = COMMAND_HANDLERS.get(message_text)
+        if handler:
+            await handler(update, context)
             return
 
-        if message_text == "/stop":
-            debug_log(DEBUG_INFO, "Processing /stop command")
-            self.stop_pty_session(self.application)
-            await update.message.reply_text("🛑 Cline session stopped")
-            return
-
-        if message_text == "/status":
-            debug_log(DEBUG_INFO, "Processing /status command")
-            status = "🟢 Running" if self.session_active else "🔴 Stopped"
-            waiting = " (waiting for input)" if self.is_waiting_for_input() else ""
-            debug_log(DEBUG_DEBUG, "Status check", 
-                     session_active=self.session_active, 
-                     waiting_for_input=self.is_waiting_for_input(),
-                     status=status)
-            await update.message.reply_text(f"Status: {status}{waiting}")
-            return
-
-        if message_text == "/cancel":
-            debug_log(DEBUG_INFO, "Processing /cancel command")
-            if self.session_active:
-                result = self.send_command("\x03")
-                debug_log(DEBUG_DEBUG, "Cancel signal sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="🛑 Cancel signal sent to Cline"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-            else:
-                await update.message.reply_text("❌ No active session to cancel")
-            return
-
-        if message_text == "/plan":
-            debug_log(DEBUG_INFO, "Processing /plan command")
-            if self.session_active:
-                result = self.send_command("/plan")
-                debug_log(DEBUG_DEBUG, "Plan mode switch sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="📋 Switched Cline to **PLAN MODE**"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-            else:
-                await update.message.reply_text("❌ No active session. Use /start first")
-            return
-
-        if message_text == "/act":
-            debug_log(DEBUG_INFO, "Processing /act command")
-            if self.session_active:
-                result = self.send_command("/act")
-                debug_log(DEBUG_DEBUG, "Act mode switch sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="⚡ Switched Cline to **ACT MODE**"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                debug_log(DEBUG_DEBUG, "After /act - queue size", 
-                         queue_size=len(self.output_queue), output=output)
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="ℹ️ Command sent. Waiting for Cline response..."
-                    )
-            else:
-                await update.message.reply_text("❌ No active session. Use /start first")
-            return
+        # Handle regular messages
+        await self._handle_regular_message(update, context)
 
         # Handle interactive input
         if self.is_waiting_for_input():
@@ -737,13 +817,8 @@ class ClineTelegramBot:
                      prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
             
             result = self.send_command(message_text)
-            debug_log(DEBUG_DEBUG, "Interactive input sent", 
+            debug_log(DEBUG_DEBUG, "Interactive input sent",
                      input=message_text, result=result)
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"📤 Input sent: {message_text}"
-            )
 
             await asyncio.sleep(0.5)
             output = self.get_pending_output()
@@ -823,13 +898,6 @@ class ClineTelegramBot:
                         text=chunk
                     )
                     debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
-                
-                '''
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ Response complete"
-                )
-                '''
             else:
                 debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
                 # Enhanced: Check if queue is being populated by background thread
@@ -906,10 +974,12 @@ async def output_monitor(bot_instance, application, chat_id):
                         if ui_hash not in recent_messages:
                             debug_log(DEBUG_INFO, f"Sending immediate UI status: {ui_message}")
                             try:
+                                '''
                                 await application.bot.send_message(
                                     chat_id=chat_id,
                                     text=f"💬 {ui_message}"
                                 )
+                                '''
                                 # Add to recent messages to prevent repeats
                                 recent_messages.add(ui_hash)
                                 if len(recent_messages) > MAX_RECENT_MESSAGES:
