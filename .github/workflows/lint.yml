@@ -30,7 +30,7 @@ jobs:
         flake8 cline_telegram_bot.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
     - name: Check code formatting with black
-      run: black --check cline_telegram_bot.py
+      run: black --check --line-length=127 cline_telegram_bot.py
 
     - name: Check import sorting with isort
       run: isort --check-only cline_telegram_bot.py

@@ -30,11 +30,11 @@ coverage:
 
 lint:
 	flake8 cline_telegram_bot.py --max-line-length=127
-	black --check cline_telegram_bot.py
+	black --check --line-length=127 cline_telegram_bot.py
 	isort --profile black --check-only cline_telegram_bot.py
 
 format:
-	black cline_telegram_bot.py
+	black --line-length=127 cline_telegram_bot.py
 	isort --profile black cline_telegram_bot.py
 
 clean:
