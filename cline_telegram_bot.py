@@ -129,9 +129,7 @@ class ClineTelegramBot:
                 continue
 
         if cline_processes:
-            debug_log(
-                DEBUG_WARN, "Found existing Cline processes", count=len(cline_processes)
-            )
+            debug_log(DEBUG_WARN, "Found existing Cline processes", count=len(cline_processes))
             for pid in cline_processes:
                 self._kill_process_tree(pid)
             time.sleep(1)
@@ -202,9 +200,7 @@ class ClineTelegramBot:
                 self.session_active = True
                 self.stop_reading = False
                 self.output_reader_healthy = False
-                self.output_thread = threading.Thread(
-                    target=self._output_reader, daemon=True
-                )
+                self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
                 self.output_thread.start()
 
                 debug_log(DEBUG_INFO, "PTY session started successfully")
@@ -224,9 +220,7 @@ class ClineTelegramBot:
                         loop = asyncio.get_event_loop()
                         loop.create_task(notify())
                     except Exception as e:
-                        debug_log(
-                            DEBUG_ERROR, "Failed to schedule notification", error=str(e)
-                        )
+                        debug_log(DEBUG_ERROR, "Failed to schedule notification", error=str(e))
 
                 return True
             except Exception as e:
@@ -329,9 +323,7 @@ class ClineTelegramBot:
                 time.sleep(0.1)
             except Exception as e:
                 error_count += 1
-                debug_log(
-                    DEBUG_ERROR, "Unexpected error in output reader", error=str(e)
-                )
+                debug_log(DEBUG_ERROR, "Unexpected error in output reader", error=str(e))
                 if error_count > 10:
                     break
                 time.sleep(0.1)
@@ -350,13 +342,10 @@ class ClineTelegramBot:
 
         is_welcome_screen = "cline cli" in clean_output
         is_box_line = bool(re.match(r"^[\s│┃╭╰╮╯]+$", clean_output.strip()))
-        is_mode_switch = any(
-            x in clean_output.lower()
-            for x in ["switch to plan", "switch to act", "plan mode", "act mode"]
-        )
-        is_mostly_empty_ui = (
-            clean_output.strip() in ["╭", "╰", "│", "┃", "╮", "╯"] or is_box_line
-        ) and len(clean_output.strip()) <= 3
+        is_mode_switch = any(x in clean_output.lower() for x in ["switch to plan", "switch to act", "plan mode", "act mode"])
+        is_mostly_empty_ui = (clean_output.strip() in ["╭", "╰", "│", "┃", "╮", "╯"] or is_box_line) and len(
+            clean_output.strip()
+        ) <= 3
 
         if not is_welcome_screen and not is_mode_switch and is_mostly_empty_ui:
             return
@@ -388,9 +377,7 @@ class ClineTelegramBot:
                 debug_log(DEBUG_INFO, "Interactive prompt detected", pattern=pattern)
                 break
 
-        if not self.waiting_for_input and re.search(
-            r"[\[\(].*[\]\)]\s*$", clean_output.strip()
-        ):
+        if not self.waiting_for_input and re.search(r"[\[\(].*[\]\)]\s*$", clean_output.strip()):
             with self.state_lock:
                 self.waiting_for_input = True
                 self.input_prompt = clean_output.strip()
@@ -412,10 +399,7 @@ class ClineTelegramBot:
 
             current_time = time.time()
             with self.state_lock:
-                if (
-                    self.waiting_for_input
-                    and (current_time - self.last_prompt_time) > 30
-                ):
+                if self.waiting_for_input and (current_time - self.last_prompt_time) > 30:
                     debug_log(DEBUG_INFO, "Resetting stale waiting_for_input state")
                     self.waiting_for_input = False
                     self.input_prompt = ""
@@ -473,9 +457,7 @@ class ClineTelegramBot:
                 return False
         return True
 
-    async def _command_handler(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str
-    ):
+    async def _command_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Generic command handler"""
         debug_log(DEBUG_INFO, f"Processing {cmd} command")
 
@@ -491,9 +473,7 @@ class ClineTelegramBot:
         if cmd in handlers:
             await handlers[cmd](update, context, cmd)
 
-    async def _start(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str
-    ):
+    async def _start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /start"""
         with self.state_lock:
             if self.session_active:
@@ -520,9 +500,7 @@ class ClineTelegramBot:
                     self._output_monitor_started = True
                     debug_log(DEBUG_DEBUG, "Output monitor task created")
                 except Exception as e:
-                    debug_log(
-                        DEBUG_ERROR, "Failed to create output monitor", error=str(e)
-                    )
+                    debug_log(DEBUG_ERROR, "Failed to create output monitor", error=str(e))
         else:
             await update.message.reply_text("❌ Failed to start Cline session")
 
@@ -531,28 +509,20 @@ class ClineTelegramBot:
         self.stop_pty_session(self.application)
         await update.message.reply_text("🛑 Cline session stopped")
 
-    async def _status(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str
-    ):
+    async def _status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /status"""
         with self.state_lock:
             status = "🟢 Running" if self.session_active else "🔴 Stopped"
             waiting = " (waiting for input)" if self.waiting_for_input else ""
             reader_status = "✓" if self.output_reader_healthy else "✗"
-        await update.message.reply_text(
-            f"Status: {status}{waiting}\nReader: {reader_status}"
-        )
+        await update.message.reply_text(f"Status: {status}{waiting}\nReader: {reader_status}")
 
-    async def _cancel(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str
-    ):
+    async def _cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /cancel - Send Ctrl+C to cancel current task"""
         if not await self._ensure_session_active(update):
             return
 
-        await self._send_message(
-            update.effective_chat.id, "🛑 Cancelling current task..."
-        )
+        await self._send_message(update.effective_chat.id, "🛑 Cancelling current task...")
 
         with self.command_lock:
             try:
@@ -561,21 +531,15 @@ class ClineTelegramBot:
                 debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
             except Exception as e:
                 debug_log(DEBUG_ERROR, "Failed to send Ctrl+C", error=str(e))
-                await self._send_message(
-                    update.effective_chat.id, f"❌ Failed to send cancel signal: {e}"
-                )
+                await self._send_message(update.effective_chat.id, f"❌ Failed to send cancel signal: {e}")
                 return
 
-    async def _mode_switch(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str
-    ):
+    async def _mode_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /plan and /act"""
         if not await self._ensure_session_active(update):
             return
         mode = cmd[1:].upper()
-        await self._send_message(
-            update.effective_chat.id, f"📋 Switched to **{mode} MODE**"
-        )
+        await self._send_message(update.effective_chat.id, f"📋 Switched to **{mode} MODE**")
         self.send_command(cmd)
         await asyncio.sleep(0.5)
         output = self.get_pending_output()
@@ -616,17 +580,13 @@ class ClineTelegramBot:
         if active:
             debug_log(DEBUG_INFO, "Processing regular command", command=message_text)
             self.send_command(message_text)
-            await self._send_message(
-                update.effective_chat.id, f"📤 Message sent: {message_text}"
-            )
+            await self._send_message(update.effective_chat.id, f"📤 Message sent: {message_text}")
             await asyncio.sleep(2.0)
             output = self.get_pending_output()
             if output:
                 await self._send_message(update.effective_chat.id, output)
         else:
-            await update.message.reply_text(
-                "❌ Cline session not running. Use /start first"
-            )
+            await update.message.reply_text("❌ Cline session not running. Use /start first")
 
 
 async def output_monitor(bot_instance, application, chat_id):
@@ -638,9 +598,7 @@ async def output_monitor(bot_instance, application, chat_id):
     while True:
         iteration_count += 1
         if iteration_count % 30 == 0:
-            debug_log(
-                DEBUG_DEBUG, "Output monitor heartbeat", iterations=iteration_count
-            )
+            debug_log(DEBUG_DEBUG, "Output monitor heartbeat", iterations=iteration_count)
 
         if not chat_id:
             await asyncio.sleep(2)
@@ -658,9 +616,7 @@ async def output_monitor(bot_instance, application, chat_id):
                 clean_output = "\n".join(lines)
 
                 ui_indicators = ["╭", "╰", "│", "┃", "/plan or /act"]
-                ui_score = sum(
-                    1 for indicator in ui_indicators if indicator in clean_output
-                )
+                ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
 
                 normalized = " ".join(clean_output.split())
                 msg_hash = hash(normalized)
@@ -686,9 +642,7 @@ async def output_monitor(bot_instance, application, chat_id):
                     output_length=len(clean_output),
                 )
                 try:
-                    await application.bot.send_message(
-                        chat_id=chat_id, text=clean_output
-                    )
+                    await application.bot.send_message(chat_id=chat_id, text=clean_output)
                 except Exception as e:
                     debug_log(DEBUG_ERROR, "Error sending output", error=str(e))
 
@@ -727,9 +681,7 @@ def main():
     application.add_handler(CommandHandler("plan", bot.handle_message))
     application.add_handler(CommandHandler("act", bot.handle_message))
     application.add_handler(CommandHandler("cancel", bot.handle_message))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     async def post_init(app):
         """Called after bot is initialized"""
