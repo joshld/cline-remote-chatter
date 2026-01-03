@@ -1,8 +1,7 @@
 
 # Cutesy Agent Router
 
-[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Tests](https://github.com/joshld/cutesy-agent-router/actions/workflows/tests.yml/badge.svg)](https://github.com/joshld/cutesy-agent-router/actions/workflows/tests.yml) [![Lint](https://github.com/joshld/cutesy-agent-router/actions/workflows/lint.yml/badge.svg)](https://github.com/joshld/cutesy-agent-router/actions/workflows/lint.yml)
 
 A Telegram bot that routes AI agent requests through a PTY session to run Cline commands.
 
@@ -18,6 +17,8 @@ A Telegram bot that routes AI agent requests through a PTY session to run Cline 
 - [Usage](#usage)
 - [Bot Commands](#bot-commands)
 - [How It Works](#how-it-works)
+- [Testing](#testing)
+- [CI/CD](#cicd)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [Logging](#logging)
@@ -30,11 +31,24 @@ Cutesy Agent Router is a Python-based Telegram bot that provides a remote interf
 
 ## Requirements
 
-- Python 3.8+
-- python-telegram-bot
-- psutil
-- python-dotenv
-- Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
+### Production Dependencies
+
+- **Python 3.9+** (tested with 3.10)
+- **python-telegram-bot** - Telegram Bot API wrapper
+- **psutil** - Process and system utilities
+- **python-dotenv** - Environment variable management
+- **Cline CLI tool** (tested with CLI v1.0.8, Core v3.39.2)
+
+### Development Dependencies
+
+- **pytest** - Testing framework
+- **pytest-asyncio** - Async testing support
+- **pytest-cov** - Coverage reporting
+- **black** - Code formatter
+- **isort** - Import sorter
+- **flake8** - Linter
+- **mypy** - Type checker
+- **pre-commit** - Git hooks framework
 
 ## Quick Start
 
@@ -42,18 +56,35 @@ Cutesy Agent Router is a Python-based Telegram bot that provides a remote interf
 # Clone and setup
 git clone https://github.com/joshld/cutesy-agent-router.git
 cd cutesy-agent-router
-pip install -r requirements.txt
+
+# Install all dependencies (production + development)
+make install
 
 # Configure environment - create .env file
 echo "TELEGRAM_BOT_TOKEN=your_bot_token_here" > .env
 echo "AUTHORIZED_USER_ID=your_telegram_user_id_here" >> .env
 # Edit the .env file with your actual values
 
+# Run full development pipeline (optional)
+make all
+
 # Run the bot
 python cline_telegram_bot.py
 ```
 
 Then message your bot on Telegram and use `/start` to begin!
+
+### Alternative Quick Setup
+
+For a minimal setup without development tools:
+
+```bash
+git clone https://github.com/joshld/cutesy-agent-router.git
+cd cutesy-agent-router
+pip install -r requirements.txt
+# Configure .env file...
+python cline_telegram_bot.py
+```
 
 ## Features
 
@@ -78,15 +109,30 @@ The bot uses a PTY (pseudo-terminal) to run Cline in a controlled environment:
 
 ## Installation
 
+### Basic Installation
+
 1. Clone the repository:
 ```bash
 git clone https://github.com/joshld/cutesy-agent-router.git
 cd cutesy-agent-router
 ```
 
-2. Install dependencies:
+2. Install production dependencies:
 ```bash
 pip install -r requirements.txt
+```
+
+### Development Installation
+
+For full development setup with testing and code quality tools:
+
+```bash
+# Install all dependencies
+make install
+
+# Install pre-commit hooks (recommended)
+pip install pre-commit
+pre-commit install
 ```
 
 3. Install Cline CLI tool:
@@ -176,7 +222,123 @@ python cline_telegram_bot.py
 - Requirements listed in `requirements.txt`
 - Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
 
+## Testing
+
+The project includes a comprehensive test suite built with `pytest` and `pytest-asyncio` for testing asynchronous code.
+
+### Running Tests
+
+```bash
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# Run all tests
+make test
+
+# Run tests with coverage report
+make coverage
+
+# Run tests quickly (no coverage)
+make test-fast
+
+# Run specific test file
+pytest test_telegram_bot.py -v
+```
+
+### Test Coverage
+
+The test suite covers:
+- **PTY Session Management**: Creation, cleanup, and process handling
+- **Output Processing**: Filtering, queue management, and message formatting
+- **Prompt Detection**: Interactive prompt recognition and state management
+- **State Transitions**: Session lifecycle and thread safety
+- **Error Recovery**: Handling of edge cases and failures
+- **UI Filtering**: Intelligent filtering of repetitive and UI elements
+- **Concurrency**: Thread safety and race condition prevention
+
+### Test Categories
+
+- **Unit Tests**: Individual component testing
+- **Integration Tests**: Full bot functionality testing
+- **Concurrency Tests**: Multi-threading and async behavior
+- **Edge Case Tests**: Error handling and boundary conditions
+
+## CI/CD
+
+The project uses GitHub Actions for automated testing and code quality checks across multiple Python versions.
+
+### Workflows
+
+- **`tests.yml`**: Runs test suite on Python 3.9, 3.10, 3.11
+- **`lint.yml`**: Code quality checks with formatting, linting, and type checking
+
+### Automated Checks
+
+- **Syntax Validation**: Python compilation check
+- **Code Formatting**: Black code formatting
+- **Import Sorting**: ISort import organization
+- **Linting**: Flake8 code quality checks
+- **Type Checking**: MyPy static type analysis (planned)
+
+### Local Development
+
+```bash
+# Run full pipeline locally
+make all
+
+# Run linting checks
+make lint
+
+# Format code
+make format
+
+# Check Python syntax
+make compile
+```
+
 ## Development
+
+### Development Tools
+
+The project includes a comprehensive development toolchain for code quality and productivity:
+
+#### Makefile Commands
+
+```bash
+make help          # Show all available commands
+make install       # Install all dependencies
+make test          # Run full test suite
+make test-fast     # Run tests without coverage
+make coverage      # Run tests with coverage report
+make lint          # Run linting and formatting checks
+make format        # Format code with black and isort
+make compile       # Check Python syntax compilation
+make clean         # Remove build artifacts
+make all           # Run full pipeline: install → compile → format → lint → test
+```
+
+#### Code Quality Tools
+
+- **Black**: Uncompromising code formatter (127 character line length)
+- **ISort**: Import sorter with black compatibility profile
+- **Flake8**: Python linter for code quality
+- **MyPy**: Static type checker (pre-commit hooks configured)
+- **Pre-commit**: Automated code quality checks on commit
+
+#### Pre-commit Hooks
+
+Install pre-commit hooks for automatic code quality checks:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+The hooks run:
+- Black formatting
+- ISort import sorting
+- Flake8 linting
+- MyPy type checking
 
 ### Code Structure
 
@@ -189,8 +351,12 @@ The code is structured with separation of concerns:
 ### Development Setup
 
 ```bash
-# Install development dependencies
-pip install -r requirements-dev.txt  # If available
+# Clone and setup
+git clone https://github.com/joshld/cutesy-agent-router.git
+cd cutesy-agent-router
+
+# Install all dependencies
+make install
 
 # Run with debug logging
 DEBUG=1 python cline_telegram_bot.py
@@ -206,17 +372,27 @@ tail -f bot.log
 - **Thread Safety**: Multiple locks for state, output queue, and PTY writes
 - **Output Filtering**: Intelligent filtering of UI elements and duplicates
 - **Health Monitoring**: Background thread health checks and recovery
+- **Prompt Detection**: Regex-based detection of interactive prompts
+- **State Management**: Thread-safe session and prompt state tracking
 
-### Testing
+### Project Structure
 
-```bash
-# Run tests (if implemented)
-python -m pytest
-
-# Manual testing
-# 1. Start bot locally
-# 2. Use Telegram Bot API to simulate messages
-# 3. Check PTY session creation and cleanup
+```
+cutesy-agent-router/
+├── cline_telegram_bot.py      # Main bot implementation
+├── test_telegram_bot.py       # Comprehensive test suite
+├── test_bot_commands.py       # Bot command tests
+├── requirements.txt           # Production dependencies
+├── requirements-dev.txt       # Development dependencies
+├── pytest.ini                 # Test configuration
+├── Makefile                   # Development automation
+├── .pre-commit-config.yaml    # Pre-commit hooks
+├── .gitignore                 # Git ignore rules
+└── .github/
+    ├── workflows/             # CI/CD pipelines
+    │   ├── tests.yml         # Test workflow
+    │   └── lint.yml          # Code quality workflow
+    └── pull_request_template.md  # PR template
 ```
 
 ## Troubleshooting
