@@ -29,8 +29,7 @@ class TestPromptDetection:
         for input_text, should_detect in test_cases:
             bot = ClineTelegramBot()
             bot._process_output(input_text)
-            assert bot.waiting_for_input == should_detect, \
-                f"Failed for: {input_text}"
+            assert bot.waiting_for_input == should_detect, f"Failed for: {input_text}"
 
     def test_detects_question_prompts(self):
         """Test detection of question-style prompts"""
@@ -44,8 +43,7 @@ class TestPromptDetection:
         for input_text, should_detect in test_cases:
             bot = ClineTelegramBot()
             bot._process_output(input_text)
-            assert bot.waiting_for_input == should_detect, \
-                f"Failed for: {input_text}"
+            assert bot.waiting_for_input == should_detect, f"Failed for: {input_text}"
 
     def test_detects_input_prompts(self):
         """Test detection of input-style prompts"""
@@ -59,8 +57,7 @@ class TestPromptDetection:
         for input_text, should_detect in test_cases:
             bot = ClineTelegramBot()
             bot._process_output(input_text)
-            assert bot.waiting_for_input == should_detect, \
-                f"Failed for: {input_text}"
+            assert bot.waiting_for_input == should_detect, f"Failed for: {input_text}"
 
     def test_detects_action_prompts(self):
         """Test detection of action-style prompts"""
@@ -73,23 +70,21 @@ class TestPromptDetection:
         for input_text, should_detect in test_cases:
             bot = ClineTelegramBot()
             bot._process_output(input_text)
-            assert bot.waiting_for_input == should_detect, \
-                f"Failed for: {input_text}"
+            assert bot.waiting_for_input == should_detect, f"Failed for: {input_text}"
 
     def test_detects_yes_no_bracket_prompts(self):
         """UPDATED: Prompts must be at end of line"""
         test_cases = [
-            ("Continue? [y/N]", True),      # ✅ Detects - at end
-            ("Continue? [y/N] ", True),     # ✅ Detects - trailing space ok
-            ("[y/N] options", False),       # ✅ NOT detected - not at end
-            ("Choose [y/N] now", False),    # ✅ NOT detected - not at end
+            ("Continue? [y/N]", True),  # ✅ Detects - at end
+            ("Continue? [y/N] ", True),  # ✅ Detects - trailing space ok
+            ("[y/N] options", False),  # ✅ NOT detected - not at end
+            ("Choose [y/N] now", False),  # ✅ NOT detected - not at end
         ]
 
         for input_text, should_detect in test_cases:
             bot = ClineTelegramBot()
             bot._process_output(input_text)
-            assert bot.waiting_for_input == should_detect, \
-                f"Failed for: {input_text} (expected {should_detect})"
+            assert bot.waiting_for_input == should_detect, f"Failed for: {input_text} (expected {should_detect})"
 
     def test_detects_prompts_not_in_middle(self):
         """Test that prompts in middle of content don't trigger"""
