@@ -19,7 +19,10 @@ def strip_ansi_codes(text):
     return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
 
 def debug_log(level, message, **kwargs):
-    """Centralized debug logging"""
+    """Centralized debug logging - respects DEBUG_MODE setting"""
+    if not DEBUG_MODE and level == DEBUG_DEBUG:
+        return  # Skip debug logs when debug mode is disabled
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     context = " | ".join(f"{k}={v}" for k, v in kwargs.items()) if kwargs else ""
     suffix = f" | {context}" if context else ""
@@ -29,6 +32,9 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 CLINE_COMMAND = ["cline"]
+
+# Debug mode control - set DEBUG_MODE=true to enable verbose logging
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 DEBUG_INFO, DEBUG_WARN, DEBUG_ERROR, DEBUG_DEBUG = "INFO", "WARN", "ERROR", "DEBUG"
 
@@ -418,6 +424,8 @@ class ClineTelegramBot:
             "/cancel": self._cancel,
             "/plan": self._mode_switch,
             "/act": self._mode_switch,
+            "/help": self._help,
+            "/reset": self._reset,
         }
         
         if cmd in handlers:
@@ -437,7 +445,7 @@ class ClineTelegramBot:
                 "✅ Cline session started\n\n**Bot Commands:**\n"
                 "• Natural language: `show me the current directory`\n"
                 "• CLI commands: `git status`, `ls`\n"
-                "• `/plan` - Plan mode\n• `/act` - Act mode\n• `/cancel` - Cancel task\n• `/status` - Check status\n• `/stop` - End session"
+                "• `/plan` - Plan mode\n• `/act` - Act mode\n• `/cancel` - Cancel task\n• `/status` - Check status\n• `/stop` - End session\n• `/help` - Show help\n• `/reset` - Force restart if stuck"
             )
             if not self._output_monitor_started:
                 try:
@@ -491,6 +499,57 @@ class ClineTelegramBot:
         output = self.get_pending_output()
         if output:
             await self._send_message(update.effective_chat.id, output)
+
+    async def _help(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /help - Show comprehensive help"""
+        help_text = """🤖 **Cline Telegram Bot Help**
+
+**Getting Started:**
+• `/start` - Start a new Cline session
+• `/stop` - Stop the current session
+• `/reset` - Force restart (use if bot is stuck)
+
+**Commands:**
+• `/status` - Check bot and session status
+• `/cancel` - Cancel current Cline operation
+
+**Mode Switching:**
+• `/plan` - Switch Cline to planning mode
+• `/act` - Switch Cline to action mode
+
+**Usage:**
+• Send natural language: `"show me the current directory"`
+• Send CLI commands: `"git status"`, `"ls -la"`
+• Interactive prompts are supported automatically
+
+**Troubleshooting:**
+• If bot seems stuck, try `/reset`
+• Check `/status` for current state
+• Use `/cancel` to interrupt long-running tasks
+
+**Debug Mode:**
+Set `DEBUG_MODE=true` in your environment for verbose logging.
+
+Need help? The bot will guide you through interactive prompts!"""
+        await update.message.reply_text(help_text)
+
+    async def _reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /reset - Force restart the bot"""
+        debug_log(DEBUG_INFO, "Processing /reset command - force restart")
+
+        # Stop current session if running
+        with self.state_lock:
+            was_active = self.session_active
+
+        if was_active:
+            self.stop_pty_session(self.application)
+            await asyncio.sleep(0.5)  # Brief pause for cleanup
+
+        # Start fresh session
+        if self.start_pty_session(self.application):
+            await update.message.reply_text("🔄 **Bot Reset Complete**\n\n✅ Fresh Cline session started\n✅ All state cleared\n✅ Ready for new commands")
+        else:
+            await update.message.reply_text("❌ Reset failed - could not start new session")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
