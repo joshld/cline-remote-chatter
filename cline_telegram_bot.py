@@ -833,8 +833,7 @@ async def output_monitor(bot_instance, application, chat_id):
     last_send_time = 0
 
     # Initialize deduplication tracking
-    recent_messages = set()
-    MAX_RECENT_MESSAGES = 10
+    recent_messages = deque(maxlen=10)
     
     while True:
         iteration_count += 1
@@ -895,9 +894,7 @@ async def output_monitor(bot_instance, application, chat_id):
                                 )
                                 '''
                                 # Add to recent messages to prevent repeats
-                                recent_messages.add(ui_hash)
-                                if len(recent_messages) > MAX_RECENT_MESSAGES:
-                                    recent_messages.pop()
+                                recent_messages.append(ui_hash)
                             except Exception as e:
                                 debug_log(DEBUG_ERROR, "Failed to send UI status", error=str(e))
                         else:
@@ -955,9 +952,7 @@ async def output_monitor(bot_instance, application, chat_id):
                                 output_length=len(clean_output),
                                 is_duplicate=is_duplicate)
                         if '/plan or /act' in clean_output:  # Add repetitive messages to dedup list
-                            recent_messages.add(normalized_output)
-                            if len(recent_messages) > MAX_RECENT_MESSAGES:
-                                recent_messages.pop()
+                            recent_messages.append(normalized_output)
                         continue
                     
                     debug_log(DEBUG_INFO, f"Sending output to user: {clean_output.replace(chr(10), '\\n')}", 
