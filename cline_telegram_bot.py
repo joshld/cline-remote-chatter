@@ -790,14 +790,14 @@ class ClineTelegramBot:
         message_text = update.message.text.strip() if update.message.text else ""
         
         debug_log(DEBUG_DEBUG, "Message details", 
-                 user_id=user_id, 
-                 authorized_id=AUTHORIZED_USER_ID,
-                 message_text_preview=message_text[:50],
-                 message_length=len(message_text))
+                user_id=user_id, 
+                authorized_id=AUTHORIZED_USER_ID,
+                message_text_preview=message_text[:50],
+                message_length=len(message_text))
 
         if user_id != AUTHORIZED_USER_ID:
             debug_log(DEBUG_WARN, "Unauthorized access attempt", 
-                     user_id=user_id, authorized_id=AUTHORIZED_USER_ID)
+                    user_id=user_id, authorized_id=AUTHORIZED_USER_ID)
             await update.message.reply_text("❌ Unauthorized access")
             return
 
@@ -825,108 +825,6 @@ class ClineTelegramBot:
 
         # Handle regular messages
         await self._handle_regular_message(update, context)
-
-        # Handle interactive input
-        if self.is_waiting_for_input():
-            debug_log(DEBUG_INFO, "Processing interactive input", 
-                     waiting_for_input=self.waiting_for_input,
-                     prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
-            
-            result = self.send_command(message_text)
-            debug_log(DEBUG_DEBUG, "Interactive input sent",
-                     input=message_text, result=result)
-
-            await asyncio.sleep(0.5)
-            output = self.get_pending_output()
-            if output:
-                debug_log(DEBUG_DEBUG, "Interactive output received", 
-                         output_length=len(output))
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=output
-                )
-            else:
-                debug_log(DEBUG_DEBUG, "No output received after interactive input")
-            return
-
-        # Regular commands
-        if self.session_active:
-            debug_log(DEBUG_INFO, "Processing regular command", 
-                     command=message_text, session_active=self.session_active)
-            
-            # Enhanced debugging: Check state before sending command
-            debug_log(DEBUG_DEBUG, "State before command", 
-                     waiting_for_input=self.waiting_for_input,
-                     queue_size_before=len(self.output_queue),
-                     current_command=self.current_command)
-            
-            result = self.send_command(message_text)
-            
-            debug_log(DEBUG_DEBUG, "Command send result", 
-                     result=result,
-                     queue_size_after_send=len(self.output_queue))
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"📤 {result}"
-            )
-
-            is_long_running = any(keyword in message_text.lower() for keyword in ['run', 'build', 'install', 'download', 'clone'])
-            if is_long_running:
-                debug_log(DEBUG_INFO, "Long-running task detected", command=message_text)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="⏳ Long-running task started. Output will be sent as it becomes available..."
-                )
-
-            await asyncio.sleep(2.0)
-            
-            # Enhanced debugging: Check state before getting output
-            debug_log(DEBUG_DEBUG, "Before get_pending_output", 
-                     queue_size=len(self.output_queue),
-                     waiting_for_input=self.is_waiting_for_input())
-            
-            output = self.get_pending_output()
-            
-            debug_log(DEBUG_DEBUG, "After get_pending_output", 
-                     got_output=bool(output),
-                     output_length=len(output) if output else 0,
-                     queue_size_after=len(self.output_queue),
-                     waiting_for_input_after=self.is_waiting_for_input())
-            
-            if not output and self.is_waiting_for_input():
-                debug_log(DEBUG_INFO, "No output but waiting for input, sending Enter to dismiss prompt")
-                self.send_enter()
-                await asyncio.sleep(0.3)
-                output = self.get_pending_output()
-                debug_log(DEBUG_DEBUG, "After Enter key, got output", 
-                         got_output=bool(output),
-                         output_length=len(output) if output else 0)
-            
-            if output:
-                debug_log(DEBUG_DEBUG, "Immediate output received", output_length=len(output))
-                chunks = [output[i:i+4000] for i in range(0, len(output), 4000)]
-                debug_log(DEBUG_DEBUG, "Sending output in chunks", 
-                         total_chunks=len(chunks), total_length=len(output))
-                for i, chunk in enumerate(chunks):
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=chunk
-                    )
-                    debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
-            else:
-                debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
-                # Enhanced: Check if queue is being populated by background thread
-                await asyncio.sleep(1)
-                queue_after_wait = len(self.output_queue)
-                debug_log(DEBUG_DEBUG, "Queue after 1 second wait", 
-                         queue_size=queue_after_wait)
-                if queue_after_wait > 0:
-                    debug_log(DEBUG_WARN, "Output appeared after delay - this suggests timing issue")
-        else:
-            debug_log(DEBUG_WARN, "Command received but session not active", 
-                     message_text=message_text, session_active=self.session_active)
-            await update.message.reply_text("❌ Cline session not running. Use /start first")
 
 async def output_monitor(bot_instance, application, chat_id):
     """Monitor for new output and send to user"""
