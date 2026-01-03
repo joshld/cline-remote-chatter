@@ -1,10 +1,51 @@
+
 # Cutesy Agent Router
 
+[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Telegram bot that routes AI agent requests through a PTY session to run Cline commands.
+
+## Table of Contents
+
+- [Description](#description)
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Bot Commands](#bot-commands)
+- [How It Works](#how-it-works)
+- [Requirements](#requirements)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Logging](#logging)
+- [Security](#security)
+- [License](#license)
 
 ## Description
 
 Cutesy Agent Router is a Python-based Telegram bot that provides a remote interface to Cline (an AI coding agent). It creates a PTY (pseudo-terminal) session that runs Cline and allows you to interact with it through Telegram messages. The bot manages the PTY session, handles command execution, and monitors output in real-time.
+
+## Quick Start
+
+```bash
+# Clone and setup
+git clone https://github.com/joshld/cutesy-agent-router.git
+cd cutesy-agent-router
+pip install -r requirements.txt
+
+# Configure environment - create .env file
+echo "TELEGRAM_BOT_TOKEN=your_bot_token_here" > .env
+echo "AUTHORIZED_USER_ID=your_telegram_user_id_here" >> .env
+# Edit the .env file with your actual values
+
+# Run the bot
+python cline_telegram_bot.py
+```
+
+Then message your bot on Telegram and use `/start` to begin!
 
 ## Features
 
@@ -122,11 +163,46 @@ python cline_telegram_bot.py
 
 ## Development
 
+### Code Structure
+
 The code is structured with separation of concerns:
 - `ClineTelegramBot` class: Core bot logic and PTY management
 - `output_monitor`: Background task for real-time output
 - `main()`: Telegram bot setup and event loop
 - Signal handlers: Graceful shutdown on SIGINT/SIGTERM
+
+### Development Setup
+
+```bash
+# Install development dependencies
+pip install -r requirements-dev.txt  # If available
+
+# Run with debug logging
+DEBUG=1 python cline_telegram_bot.py
+
+# Check logs
+tail -f bot.log
+```
+
+### Key Components
+
+- **PTY Management**: Uses `pty.openpty()` for terminal emulation
+- **Process Tree Handling**: `psutil` for comprehensive process cleanup
+- **Thread Safety**: Multiple locks for state, output queue, and PTY writes
+- **Output Filtering**: Intelligent filtering of UI elements and duplicates
+- **Health Monitoring**: Background thread health checks and recovery
+
+### Testing
+
+```bash
+# Run tests (if implemented)
+python -m pytest
+
+# Manual testing
+# 1. Start bot locally
+# 2. Use Telegram Bot API to simulate messages
+# 3. Check PTY session creation and cleanup
+```
 
 ## Troubleshooting
 
