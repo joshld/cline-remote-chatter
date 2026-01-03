@@ -9,6 +9,7 @@ A Telegram bot that routes AI agent requests through a PTY session to run Cline 
 ## Table of Contents
 
 - [Description](#description)
+- [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Features](#features)
 - [Architecture](#architecture)
@@ -17,7 +18,6 @@ A Telegram bot that routes AI agent requests through a PTY session to run Cline 
 - [Usage](#usage)
 - [Bot Commands](#bot-commands)
 - [How It Works](#how-it-works)
-- [Requirements](#requirements)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [Logging](#logging)
@@ -27,6 +27,14 @@ A Telegram bot that routes AI agent requests through a PTY session to run Cline 
 ## Description
 
 Cutesy Agent Router is a Python-based Telegram bot that provides a remote interface to Cline (an AI coding agent). It creates a PTY (pseudo-terminal) session that runs Cline and allows you to interact with it through Telegram messages. The bot manages the PTY session, handles command execution, and monitors output in real-time.
+
+## Requirements
+
+- Python 3.8+
+- python-telegram-bot
+- psutil
+- python-dotenv
+- Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
 
 ## Quick Start
 
@@ -161,14 +169,6 @@ python cline_telegram_bot.py
    - File descriptors are closed
    - Background threads are stopped
    - Resources are cleaned up
-
-## Requirements
-
-- Python 3.8+
-- python-telegram-bot
-- psutil
-- python-dotenv
-- Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
 
 ## Development
 
