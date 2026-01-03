@@ -519,6 +519,27 @@ class TestMemoryManagement:
             assert len(bot.output_queue) == 0
             assert bot.session_active is False
 
+    def test_ui_ratio_calculation(self):
+        """Test UI ratio calculation"""
+        bot = ClineTelegramBot()
+        bot._process_output("hello world")
+        assert len(bot.output_queue) > 0  # Should be allowed (no UI elements)
+
+        bot2 = ClineTelegramBot()
+        bot2._process_output("╭")  # Single box character should be filtered
+        assert len(bot2.output_queue) == 0  # Should be filtered (mostly empty UI)
+
+    def test_ui_score_threshold(self):
+        """Test UI score threshold"""
+        bot = ClineTelegramBot()
+        # Long informative message - should pass through _process_output
+        bot._process_output("Here is a long informative message with lots of content that explains something useful about the project")
+        assert len(bot.output_queue) > 0  # Should be allowed (processed normally)
+
+        bot2 = ClineTelegramBot()
+        bot2._process_output("│││")  # Multiple box characters, short length - should be filtered
+        assert len(bot2.output_queue) == 0  # Should be filtered (mostly empty UI)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
