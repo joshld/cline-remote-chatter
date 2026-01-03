@@ -94,17 +94,19 @@ pip install -r requirements.txt
    Follow the [official Cline CLI installation guide](https://docs.cline.bot/cline-cli/installation) for detailed instructions.
 
    Quick install via npm:
-   ```bash
-   npm install -g cline
-   cline auth  # Authenticate with your Cline account
-   cline version
-   ```
+```bash
+npm install -g cline
+cline auth  # Authenticate with your Cline account
+cline version
+```
 
 ## Configuration
 
 Create a `.env` file with your Telegram bot token and authorized user ID:
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-AUTHORIZED_USER_ID=your_telegram_user_id_here
+```
+TELEGRAM_BOT_TOKEN=#your_bot_token_here
+AUTHORIZED_USER_ID=#your_telegram_user_id_here
+```
 
 To get your Telegram bot token:
 - Message @BotFather on Telegram
@@ -222,7 +224,6 @@ python -m pytest
 **Bot won't start:**
 - Check TELEGRAM_BOT_TOKEN is set correctly
 - Verify Cline is installed and in PATH
-- Check port 8443 is available (if using webhooks)
 
 **No output from Cline:**
 - Use `/status` to check if session is active
