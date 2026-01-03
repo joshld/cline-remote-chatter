@@ -81,10 +81,16 @@ cd cutesy-agent-router
 pip install -r requirements.txt
 ```
 
-3. Ensure Cline is installed and available in your PATH:
-```bash
-cline --version  # Should work
-```
+3. Install Cline CLI tool:
+
+   Follow the [official Cline CLI installation guide](https://docs.cline.bot/cline-cli/installation) for detailed instructions.
+
+   Quick install via npm:
+   ```bash
+   npm install -g cline
+   cline auth  # Authenticate with your Cline account
+   cline version
+   ```
 
 ## Configuration
 
@@ -160,6 +166,7 @@ python cline_telegram_bot.py
 
 - Python 3.9+ (tested with 3.10)
 - Requirements listed in `requirements.txt`
+- Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
 
 ## Development
 
