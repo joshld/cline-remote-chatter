@@ -3,14 +3,13 @@ Additional unit tests for ClineTelegramBot
 Covers areas not tested in the main test suite
 """
 
-import pytest
-import asyncio
+import asyncio  # noqa: F401
+import os  # noqa: F401
 import threading
 import time
-import os
-import re
-from unittest.mock import Mock, MagicMock, patch, AsyncMock
-from collections import deque
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from cline_telegram_bot import ClineTelegramBot, strip_ansi_codes
 
@@ -73,8 +72,8 @@ class TestPromptDetection:
         bot = ClineTelegramBot()
 
         bot._process_output("This is content about [y/N] options")
-        # Should still detect because of the regex pattern
-        assert bot.waiting_for_input is True
+        # Should NOT detect because [y/N] is in middle of content, not at end
+        assert bot.waiting_for_input is False
 
     def test_input_prompt_stored_correctly(self):
         """Test that the detected prompt is stored correctly"""
@@ -533,7 +532,10 @@ class TestMemoryManagement:
         """Test UI score threshold"""
         bot = ClineTelegramBot()
         # Long informative message - should pass through _process_output
-        bot._process_output("Here is a long informative message with lots of content that explains something useful about the project")
+        # This tests that substantial content is preserved
+        bot._process_output(
+            "Here is a long informative message with lots of content " "that explains something useful about the project"
+        )
         assert len(bot.output_queue) > 0  # Should be allowed (processed normally)
 
         bot2 = ClineTelegramBot()

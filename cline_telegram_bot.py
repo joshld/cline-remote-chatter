@@ -353,20 +353,20 @@ class ClineTelegramBot:
 
         # Detect interactive prompts
         prompt_patterns = [
-            r"\[y/N\]",
-            r"\[Y/n\]",
-            r"\(y/n\)",
-            r"\(Y/N\)",
-            r"Continue\?",
-            r"Proceed\?",
-            r"Are you sure\?",
+            r"\[y/N\]\s*$",
+            r"\[Y/n\]\s*$",
+            r"\(y/n\)\s*$",
+            r"\(Y/N\)\s*$",
+            r"Continue\?\s*$",
+            r"Proceed\?\s*$",
+            r"Are you sure\?\s*$",
             r"Enter .*:\s*$",
             r"Password:\s*$",
-            r"Press.*Enter.*to.*continue",
-            r"Press.*any.*key",
+            r"Press.*Enter.*to.*continue\s*$",
+            r"Press.*any.*key\s*$",
             r"\[.*\]\s*$",
-            r"Press .*to exit",
-            r"Press .* to return",
+            r"Press .*to exit\s*$",
+            r"Press .* to return\s*$",
         ]
 
         for pattern in prompt_patterns:

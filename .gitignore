@@ -62,15 +62,12 @@ node_modules/
 
 # Unit test / coverage reports
 .coverage.*
-.pytest_cache/
-htmlcov/
 
 # Translations
 *.mo
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -112,10 +109,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
-.venv
-env/
-venv/
 ENV/
 env.bak/
 venv.bak/
@@ -129,11 +122,6 @@ venv.bak/
 
 # mkdocs documentation
 /site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
 # Pyre type checker
 .pyre/

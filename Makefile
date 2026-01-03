@@ -15,13 +15,13 @@ install:
 	pip install -r requirements-dev.txt
 
 test:
-	pytest test_telegram_bot.py -v
+	pytest -v
 
 test-fast:
-	pytest test_telegram_bot.py -v --tb=line
+	pytest -v --tb=line
 
 coverage:
-	pytest test_telegram_bot.py \
+	pytest \
 		--cov=cline_telegram_bot \
 		--cov-report=html \
 		--cov-report=term-missing \
@@ -29,13 +29,13 @@ coverage:
 	@echo "\nCoverage report generated. Open htmlcov/index.html to view."
 
 lint:
-	flake8 cline_telegram_bot.py --max-line-length=127
-	black --check --line-length=127 cline_telegram_bot.py
-	isort --profile black --check-only cline_telegram_bot.py
+	flake8 *.py --max-line-length=127
+	black --check --line-length=127 *.py
+	isort --profile black --check-only *.py
 
 format:
-	black --line-length=127 cline_telegram_bot.py
-	isort --profile black cline_telegram_bot.py
+	black --line-length=127 *.py
+	isort --profile black *.py
 
 clean:
 	find . -type f -name '*.pyc' -delete

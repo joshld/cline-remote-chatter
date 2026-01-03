@@ -4,7 +4,6 @@ Simple test script to verify Telegram bot functionality
 """
 
 import os
-import time
 import subprocess
 import sys
 
