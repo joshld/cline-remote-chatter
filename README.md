@@ -44,7 +44,7 @@ AUTHORIZED_USER_ID=your_telegram_user_id
 
 ## Development
 
-- Python 3.8+
+- Python 3.9+ (tested with 3.10)
 - Requirements listed in `requirements.txt`
 
 ## Contributing
