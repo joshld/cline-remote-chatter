@@ -348,6 +348,7 @@ class ClineTelegramBot:
         ) <= 3
 
         if not is_welcome_screen and not is_mode_switch and is_mostly_empty_ui:
+            debug_log(DEBUG_DEBUG, f"Filtered UI message: {repr(clean_output)}", reason="mostly_empty_ui")
             return
 
         # Detect interactive prompts
@@ -622,15 +623,31 @@ async def output_monitor(bot_instance, application, chat_id):
                 msg_hash = hash(normalized)
                 is_cline_response = "###" in clean_output
                 is_repetitive_ui = ui_score >= 1 and "/plan or /act" in clean_output
+                # Only filter repetitive UI if the message is mostly UI elements (high UI ratio)
+                ui_ratio = ui_score / max(1, len(clean_output.split()))
+                is_mostly_ui = ui_ratio > 0.3 or (ui_score >= 2 and len(clean_output.strip()) <= 100)
 
                 should_filter = (
                     msg_hash in recent_messages
-                    or (is_repetitive_ui and not is_cline_response)
-                    or (ui_score >= 2 and len(clean_output.strip()) <= 50)
+                    or (is_repetitive_ui and not is_cline_response and is_mostly_ui)
+                    or (ui_score >= 3 and len(clean_output.strip()) <= 50)
                 )
 
                 if should_filter:
-                    debug_log(DEBUG_DEBUG, "Filtered message", ui_score=ui_score)
+                    reason = "unknown"
+                    if msg_hash in recent_messages:
+                        reason = "duplicate_message"
+                    elif is_repetitive_ui and not is_cline_response and is_mostly_ui:
+                        reason = "repetitive_ui_mostly_ui"
+                    elif ui_score >= 3 and len(clean_output.strip()) <= 50:
+                        reason = "high_ui_score"
+
+                    debug_log(
+                        DEBUG_DEBUG,
+                        f"Filtered output message: {clean_output!r}",
+                        reason=reason,
+                        ui_score=ui_score,
+                    )
                     if is_repetitive_ui:
                         recent_messages.append(msg_hash)
                     await asyncio.sleep(2)
@@ -640,6 +657,7 @@ async def output_monitor(bot_instance, application, chat_id):
                     DEBUG_INFO,
                     "Sending output to user",
                     output_length=len(clean_output),
+                    message_preview=clean_output[:100] + "..." if len(clean_output) > 100 else clean_output,
                 )
                 try:
                     await application.bot.send_message(chat_id=chat_id, text=clean_output)
