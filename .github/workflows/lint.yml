@@ -1,0 +1,36 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy
+
+    - name: Lint with flake8
+      run: |
+        # E501: line too long, W503: line break before binary operator
+        flake8 cline_telegram_bot.py --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 cline_telegram_bot.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Check code formatting with black
+      run: black --check cline_telegram_bot.py
+
+    - name: Check import sorting with isort
+      run: isort --check-only cline_telegram_bot.py
