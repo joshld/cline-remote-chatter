@@ -8,6 +8,7 @@ import time
 import subprocess
 import sys
 
+
 def test_bot_commands():
     """Test basic bot functionality"""
     print("🧪 Testing Telegram Bot Commands")
@@ -15,8 +16,7 @@ def test_bot_commands():
     # Check if bot is running
     print("\n1. Checking if bot process is running...")
     try:
-        result = subprocess.run(['pgrep', '-f', 'cline_telegram_bot.py'],
-                              capture_output=True, text=True)
+        result = subprocess.run(["pgrep", "-f", "cline_telegram_bot.py"], capture_output=True, text=True)
         if result.stdout.strip():
             print(f"✅ Bot is running (PID: {result.stdout.strip()})")
         else:
@@ -29,8 +29,8 @@ def test_bot_commands():
     # Check bot log
     print("\n2. Checking bot log...")
     try:
-        if os.path.exists('bot.log'):
-            with open('bot.log', 'r') as f:
+        if os.path.exists("bot.log"):
+            with open("bot.log", "r") as f:
                 log_content = f.read()
                 if log_content:
                     print(f"✅ Bot log exists with content ({len(log_content)} bytes)")
@@ -56,6 +56,7 @@ def test_bot_commands():
     print("- Check process with: ps aux | grep cline_telegram_bot")
 
     return True
+
 
 if __name__ == "__main__":
     success = test_bot_commands()
