@@ -33,4 +33,4 @@ jobs:
       run: black --check --line-length=127 cline_telegram_bot.py
 
     - name: Check import sorting with isort
-      run: isort --check-only cline_telegram_bot.py
+      run: isort --profile black --check-only cline_telegram_bot.py
