@@ -17,55 +17,92 @@ from cline_telegram_bot import ClineTelegramBot, strip_ansi_codes
 class TestPromptDetection:
     """Test various prompt detection patterns"""
 
-    def test_detects_yes_no_bracket_prompts(self):
-        """Test detection of [y/N] style prompts"""
-        bot = ClineTelegramBot()
-
+    def test_detects_parenthesis_prompts(self):
+        """Test detection of (y/n) style prompts at end of line"""
         test_cases = [
-            "Continue? [y/N] ",
-            "Proceed? [Y/n]",
-            "Are you sure? [Y/N]",
+            ("Continue? (y/n)", True),
+            ("Continue? (Y/N)", True),
+            ("(y/n)", True),
+            ("Choose (y/n) wisely", False),  # Not at end
         ]
 
-        for prompt in test_cases:
-            bot = ClineTelegramBot()  # Reset for each test
-            bot._process_output(prompt)
-            assert bot.waiting_for_input is True, f"Failed to detect: {prompt}"
+        for input_text, should_detect in test_cases:
+            bot = ClineTelegramBot()
+            bot._process_output(input_text)
+            assert bot.waiting_for_input == should_detect, \
+                f"Failed for: {input_text}"
 
-    def test_detects_parenthesis_prompts(self):
-        """Test detection of (y/n) style prompts"""
+    def test_detects_question_prompts(self):
+        """Test detection of question-style prompts"""
+        test_cases = [
+            ("Continue?", True),
+            ("Proceed?", True),
+            ("Are you sure?", True),
+            ("Continue? And more text", False),  # Not at end
+        ]
+
+        for input_text, should_detect in test_cases:
+            bot = ClineTelegramBot()
+            bot._process_output(input_text)
+            assert bot.waiting_for_input == should_detect, \
+                f"Failed for: {input_text}"
+
+    def test_detects_input_prompts(self):
+        """Test detection of input-style prompts"""
+        test_cases = [
+            ("Password: ", True),
+            ("Enter your name: ", True),
+            ("Enter something: ", True),
+            ("Password: in the text", False),  # Not at end
+        ]
+
+        for input_text, should_detect in test_cases:
+            bot = ClineTelegramBot()
+            bot._process_output(input_text)
+            assert bot.waiting_for_input == should_detect, \
+                f"Failed for: {input_text}"
+
+    def test_detects_action_prompts(self):
+        """Test detection of action-style prompts"""
+        test_cases = [
+            ("Press Enter to continue", True),
+            ("Press any key", True),
+            ("Press Enter to continue and more", False),  # Not at end
+        ]
+
+        for input_text, should_detect in test_cases:
+            bot = ClineTelegramBot()
+            bot._process_output(input_text)
+            assert bot.waiting_for_input == should_detect, \
+                f"Failed for: {input_text}"
+
+    def test_detects_yes_no_bracket_prompts(self):
+        """UPDATED: Prompts must be at end of line"""
+        test_cases = [
+            ("Continue? [y/N]", True),      # ✅ Detects - at end
+            ("Continue? [y/N] ", True),     # ✅ Detects - trailing space ok
+            ("[y/N] options", False),       # ✅ NOT detected - not at end
+            ("Choose [y/N] now", False),    # ✅ NOT detected - not at end
+        ]
+
+        for input_text, should_detect in test_cases:
+            bot = ClineTelegramBot()
+            bot._process_output(input_text)
+            assert bot.waiting_for_input == should_detect, \
+                f"Failed for: {input_text} (expected {should_detect})"
+
+    def test_detects_prompts_not_in_middle(self):
+        """Test that prompts in middle of content don't trigger"""
         bot = ClineTelegramBot()
 
-        bot._process_output("Continue? (y/n)")
-        assert bot.waiting_for_input is True
+        # Prompt in middle - should NOT trigger
+        bot._process_output("This explains [y/N] but doesn't ask")
+        assert bot.waiting_for_input is False
 
-    def test_detects_continue_prompt(self):
-        """Test detection of 'Continue?' prompts"""
-        bot = ClineTelegramBot()
-
-        bot._process_output("Continue?")
-        assert bot.waiting_for_input is True
-
-    def test_detects_password_prompt(self):
-        """Test detection of password prompts"""
-        bot = ClineTelegramBot()
-
-        bot._process_output("Password: ")
-        assert bot.waiting_for_input is True
-
-    def test_detects_enter_prompt(self):
-        """Test detection of 'Enter ...' prompts"""
-        bot = ClineTelegramBot()
-
-        bot._process_output("Enter your name: ")
-        assert bot.waiting_for_input is True
-
-    def test_detects_press_key_prompt(self):
-        """Test detection of 'Press ...' prompts"""
-        bot = ClineTelegramBot()
-
-        bot._process_output("Press Enter to continue")
-        assert bot.waiting_for_input is True
+        # Prompt at end - should trigger
+        bot2 = ClineTelegramBot()
+        bot2._process_output("This explains something - [y/N]")
+        assert bot2.waiting_for_input is True
 
     def test_prompt_not_detected_in_content(self):
         """Test that prompts in middle of content don't trigger waiting state"""
