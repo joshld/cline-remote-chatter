@@ -1,3 +1,5 @@
 python-telegram-bot
 python-dotenv
 psutil
+pytest
+pytest-asyncio
