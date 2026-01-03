@@ -34,3 +34,6 @@ jobs:
 
     - name: Check import sorting with isort
       run: isort --profile black --check-only cline_telegram_bot.py
+
+    - name: Check Python syntax compilation
+      run: python3 -m py_compile *.py
