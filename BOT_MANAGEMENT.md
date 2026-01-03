@@ -111,9 +111,9 @@ After=network.target
 
 [Service]
 User=user_name
-WorkingDirectory=/home/user_name/cline-workspace/cline-remote-chatter
+WorkingDirectory=/home/user_name/workspace/cutesy-agent-router
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 /home/user_name/cline-workspace/cline-remote-chatter/cline_telegram_bot.py
+ExecStart=/usr/bin/python3 /home/user_name/workspace/cutesy-agent-router/cline_telegram_bot.py
 Restart=always
 RestartSec=5
 StandardOutput=syslog
