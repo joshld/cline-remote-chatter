@@ -80,7 +80,7 @@ The bot uses a PTY (pseudo-terminal) to run Cline in a controlled environment:
 
 1. Clone the repository:
 ```bash
-git clone git@github.com:joshld/cutesy-agent-router.git
+git clone https://github.com/joshld/cutesy-agent-router.git
 cd cutesy-agent-router
 ```
 
@@ -103,10 +103,8 @@ pip install -r requirements.txt
 ## Configuration
 
 Create a `.env` file with your Telegram bot token and authorized user ID:
-```bash
 TELEGRAM_BOT_TOKEN=your_bot_token_here
-AUTHORIZED_USER_ID=your_telegram_user_id
-```
+AUTHORIZED_USER_ID=your_telegram_user_id_here
 
 To get your Telegram bot token:
 - Message @BotFather on Telegram
@@ -259,4 +257,4 @@ The bot creates a `bot.log` file with detailed debug information:
 
 ## License
 
-MIT
+[MIT](https://opensource.org/licenses/MIT)
