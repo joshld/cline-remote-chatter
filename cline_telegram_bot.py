@@ -6,6 +6,7 @@ import threading
 import time
 import asyncio
 import re
+import signal
 from collections import deque
 from datetime import datetime
 from telegram import Update
@@ -15,78 +16,59 @@ import psutil
 
 def strip_ansi_codes(text):
     """Remove ANSI escape sequences from text"""
-    ansi_pattern = r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])'
-    return re.sub(ansi_pattern, '', text)
+    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
 
-# Load environment variables
+def debug_log(level, message, **kwargs):
+    """Centralized debug logging"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    context = " | ".join(f"{k}={v}" for k, v in kwargs.items()) if kwargs else ""
+    suffix = f" | {context}" if context else ""
+    print(f"[{timestamp}] [{level}] {message}{suffix}")
+
 load_dotenv()
-
-# Configuration from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 CLINE_COMMAND = ["cline"]
 
-def debug_log(level, message, **kwargs):
-    """Centralized debug logging function"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    prefix = f"[{timestamp}] [{level}]"
-    
-    if kwargs:
-        context = " | ".join([f"{k}={v}" for k, v in kwargs.items()])
-        message = f"{prefix} {message} | {context}"
-    else:
-        message = f"{prefix} {message}"
-    
-    print(message)
-
-# Debug level constants
-DEBUG_INFO = "INFO"
-DEBUG_WARN = "WARN"
-DEBUG_ERROR = "ERROR"
-DEBUG_DEBUG = "DEBUG"
+DEBUG_INFO, DEBUG_WARN, DEBUG_ERROR, DEBUG_DEBUG = "INFO", "WARN", "ERROR", "DEBUG"
 
 class ClineTelegramBot:
     def __init__(self):
         debug_log(DEBUG_INFO, "ClineTelegramBot.__init__ called")
         
+        # Thread synchronization
+        self.state_lock = threading.RLock()  # Reentrant lock for state changes
+        self.output_queue_lock = threading.Lock()  # Separate lock for queue
+        self.command_lock = threading.Lock()  # Lock for PTY writes
+        
         self.master_fd = None
         self.slave_fd = None
         self.process = None
         self.is_running = False
-
-        # Output handling
         self.output_queue = deque()
         self.output_thread = None
         self.stop_reading = False
-
-        # Command handling
-        self.command_queue = deque()
         self.current_command = None
         self.waiting_for_input = False
         self.input_prompt = ""
-
-        # Session state
+        self.last_prompt_time = 0
         self.session_active = False
-        
-        # Process tracking for cleanup
         self.child_pids = set()
-        
-        # Application reference for notifications
         self.application = None
+        self.last_chat_id = None
+        self._output_monitor_started = False
         
-        debug_log(DEBUG_DEBUG, "Bot initialized with default state", 
-                 master_fd=self.master_fd, slave_fd=self.slave_fd, 
-                 is_running=self.is_running, session_active=self.session_active)
+        # Health monitoring
+        self.output_reader_healthy = False
+        self.last_reader_heartbeat = time.time()
 
     def _find_child_processes(self, parent_pid):
         """Find all child processes of a given PID"""
         children = set()
         try:
             parent = psutil.Process(parent_pid)
-            # Get all descendants
             for child in parent.children(recursive=True):
                 children.add(child.pid)
-            # Also add the parent itself
             children.add(parent_pid)
         except psutil.NoSuchProcess:
             pass
@@ -100,849 +82,537 @@ class ClineTelegramBot:
             
             for child_pid in children:
                 try:
-                    process = psutil.Process(child_pid)
-                    # Try graceful termination first
-                    process.terminate()
+                    psutil.Process(child_pid).terminate()
                 except psutil.NoSuchProcess:
                     continue
             
-            # Wait for processes to terminate
             time.sleep(0.5)
             
-            # Force kill any remaining processes
             for child_pid in children:
                 try:
-                    process = psutil.Process(child_pid)
-                    if process.is_running():
-                        process.kill()
+                    p = psutil.Process(child_pid)
+                    if p.is_running():
+                        p.kill()
                 except psutil.NoSuchProcess:
                     pass
             
-            # Wait for cleanup
             time.sleep(0.2)
             debug_log(DEBUG_DEBUG, "Process tree killed", parent_pid=pid)
-            
         except Exception as e:
-            debug_log(DEBUG_ERROR, "Error killing process tree", 
-                     pid=pid, error_type=type(e).__name__, error=str(e))
+            debug_log(DEBUG_ERROR, "Error killing process tree", pid=pid, error=str(e))
 
     def _ensure_session_clean(self):
         """Ensure no existing Cline processes are running"""
-        debug_log(DEBUG_INFO, "Checking for existing Cline processes")
-        
-        # Look for any running cline processes
         cline_processes = []
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                cmdline = proc.info['cmdline'] or []
-                cmdline_str = ' '.join(cmdline)
-                if 'cline' in cmdline_str and 'python' not in cmdline_str:
+                cmdline = ' '.join(proc.info['cmdline'] or [])
+                if 'cline' in cmdline and 'python' not in cmdline:
                     cline_processes.append(proc.info['pid'])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         
         if cline_processes:
-            debug_log(DEBUG_WARN, "Found existing Cline processes", 
-                     pids=cline_processes, count=len(cline_processes))
-            
+            debug_log(DEBUG_WARN, "Found existing Cline processes", count=len(cline_processes))
             for pid in cline_processes:
                 self._kill_process_tree(pid)
-            
-            # Wait for cleanup
             time.sleep(1)
-            debug_log(DEBUG_INFO, "Cleaned up existing processes")
-        else:
-            debug_log(DEBUG_DEBUG, "No existing Cline processes found")
+
+    def _close_fd(self, fd, fd_name):
+        """Close a file descriptor safely"""
+        if fd:
+            try:
+                os.close(fd)
+                debug_log(DEBUG_DEBUG, f"Closed {fd_name}")
+            except Exception as e:
+                debug_log(DEBUG_ERROR, f"Error closing {fd_name}", error=str(e))
+            return None
+        return None
+
+    def _cleanup_resources(self):
+        """Comprehensive cleanup of all resources"""
+        debug_log(DEBUG_INFO, "Performing comprehensive cleanup")
+        self.stop_reading = True
+        
+        if self.process:
+            self._kill_process_tree(self.process.pid)
+            self.process = None
+        self._ensure_session_clean()
+        
+        self.master_fd = self._close_fd(self.master_fd, "master_fd")
+        self.slave_fd = self._close_fd(self.slave_fd, "slave_fd")
+        self.is_running = False
+        self.session_active = False
+        self.child_pids.clear()
+        
+        with self.output_queue_lock:
+            self.output_queue.clear()
+        
+        debug_log(DEBUG_DEBUG, "Cleanup complete")
 
     def start_pty_session(self, application=None):
         """Start PTY session with proper process management"""
         debug_log(DEBUG_INFO, "start_pty_session called")
         
-        # Check if already running
-        if self.session_active:
-            debug_log(DEBUG_WARN, "Session already active, refusing to start new one")
-            return False
-        
-        # Ensure clean state before starting
-        self._ensure_session_clean()
-        
-        try:
-            debug_log(DEBUG_DEBUG, "Opening PTY...")
-            self.master_fd, self.slave_fd = pty.openpty()
-            debug_log(DEBUG_DEBUG, "PTY opened successfully", 
-                     master_fd=self.master_fd, slave_fd=self.slave_fd)
-
-            debug_log(DEBUG_DEBUG, "Starting subprocess", 
-                     command=CLINE_COMMAND, slave_fd=self.slave_fd)
+        with self.state_lock:
+            if self.session_active:
+                debug_log(DEBUG_WARN, "Session already active")
+                return False
             
-            # Start Cline with proper environment
-            env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
+            self._ensure_session_clean()
             
-            # Use process group to kill entire tree
-            self.process = subprocess.Popen(
-                CLINE_COMMAND,
-                stdin=self.slave_fd,
-                stdout=self.slave_fd,
-                stderr=self.slave_fd,
-                preexec_fn=os.setsid,  # Create new process group
-                env=env
-            )
-            
-            debug_log(DEBUG_DEBUG, "Subprocess started", 
-                     pid=self.process.pid, returncode=self.process.poll())
-
-            # Track the main process
-            self.child_pids = {self.process.pid}
-            
-            # Wait a moment and check if process is still alive
-            time.sleep(0.5)
-            if self.process.poll() is not None:
-                raise RuntimeError("Cline process died immediately")
-
-            self.is_running = True
-            self.session_active = True
-            debug_log(DEBUG_DEBUG, "State updated", 
-                     is_running=self.is_running, session_active=self.session_active)
-
-            # Start background output reader
-            self.stop_reading = False
-            self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
-            self.output_thread.start()
-            debug_log(DEBUG_DEBUG, "Output reader thread started", 
-                     thread_name=self.output_thread.name, daemon=self.output_thread.daemon)
-
-            debug_log(DEBUG_INFO, "PTY session started successfully")
-            
-            # Wait for Cline to initialize
-            time.sleep(1)
-            
-            # Send session start notification
-            if application:
-                async def send_session_start_notification():
-                    try:
-                        await application.bot.send_message(
-                            chat_id=AUTHORIZED_USER_ID,
-                            text="🟢 **Cline Session Started**\n\n"
-                                 "PTY session is now active and ready for commands.\n"
-                                 "Output will be sent automatically as it becomes available.\n\n"
-                                 "**Mode Commands:**\n"
-                                 "/plan - Switch to plan mode\n"
-                                 "/act - Switch to act mode\n"
-                                 "/cancel - Cancel current task"
-                        )
-                        debug_log(DEBUG_INFO, "Session start notification sent")
-                    except Exception as e:
-                        debug_log(DEBUG_ERROR, "Failed to send session start notification", 
-                                 error_type=type(e).__name__, error=str(e))
+            try:
+                self.master_fd, self.slave_fd = pty.openpty()
+                env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
                 
-                try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(send_session_start_notification())
-                except Exception as e:
-                    debug_log(DEBUG_ERROR, "Failed to schedule session start notification", 
-                             error_type=type(e).__name__, error=str(e))
-            
-            return True
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to start PTY session", 
-                     error_type=type(e).__name__, error=str(e), exc_info=True)
-            # Cleanup on failure
-            self._cleanup_resources()
-            return False
+                self.process = subprocess.Popen(
+                    CLINE_COMMAND,
+                    stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd,
+                    preexec_fn=os.setsid, env=env
+                )
+                
+                self.child_pids = {self.process.pid}
+                time.sleep(0.5)
+                
+                if self.process.poll() is not None:
+                    raise RuntimeError("Cline process died immediately")
+
+                self.is_running = True
+                self.session_active = True
+                self.stop_reading = False
+                self.output_reader_healthy = False
+                self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
+                self.output_thread.start()
+
+                debug_log(DEBUG_INFO, "PTY session started successfully")
+                time.sleep(1)
+                
+                if application:
+                    async def notify():
+                        await self._send_notification(
+                            AUTHORIZED_USER_ID,
+                            "🟢 **Cline Session Started**\n\nPTY session is now active and ready for commands.",
+                            "Session start notification sent",
+                            "Failed to send session start notification"
+                        )
+                    
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(notify())
+                    except Exception as e:
+                        debug_log(DEBUG_ERROR, "Failed to schedule notification", error=str(e))
+                
+                return True
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Failed to start PTY session", error=str(e))
+                self._cleanup_resources()
+                return False
 
     def stop_pty_session(self, application=None):
         """Stop PTY session with comprehensive cleanup"""
         debug_log(DEBUG_INFO, "stop_pty_session called")
         
-        if not self.session_active:
-            debug_log(DEBUG_DEBUG, "No active session to stop")
-            return
+        with self.state_lock:
+            if not self.session_active:
+                return
 
-        self.stop_reading = True
-        self.session_active = False
-        debug_log(DEBUG_DEBUG, "State updated", 
-                 stop_reading=self.stop_reading, session_active=self.session_active)
+            self.stop_reading = True
+            self.session_active = False
 
-        # Kill all tracked processes
-        if self.process:
-            debug_log(DEBUG_DEBUG, "Stopping process", 
-                     pid=self.process.pid, returncode=self.process.poll())
-            
-            # Kill the entire process tree
-            self._kill_process_tree(self.process.pid)
-            
-            # Also kill any processes we might have missed
-            self._ensure_session_clean()
+            if self.process:
+                self._kill_process_tree(self.process.pid)
+                self._ensure_session_clean()
 
-        # Wait for output thread to finish
-        if self.output_thread and self.output_thread.is_alive():
-            debug_log(DEBUG_DEBUG, "Waiting for output thread to finish")
-            self.output_thread.join(timeout=2.0)
-            if self.output_thread.is_alive():
-                debug_log(DEBUG_WARN, "Output thread did not finish cleanly")
+            # Wait for reader thread to notice stop_reading flag
+            time.sleep(0.3)
 
-        # Cleanup file descriptors
-        self._cleanup_file_descriptors()
+            if self.output_thread and self.output_thread.is_alive():
+                self.output_thread.join(timeout=2.0)
+                if self.output_thread.is_alive():
+                    debug_log(DEBUG_WARN, "Output thread did not exit cleanly")
 
-        # Reset state
-        self.process = None
-        self.child_pids.clear()
-        self.is_running = False
-        debug_log(DEBUG_DEBUG, "Final state", is_running=self.is_running)
-        debug_log(DEBUG_INFO, "PTY session stopped")
+            self._cleanup_resources()
+            self._output_monitor_started = False
         
-        # Send session stop notification
         if application:
-            async def send_session_stop_notification():
-                try:
-                    await application.bot.send_message(
-                        chat_id=AUTHORIZED_USER_ID,
-                        text="🔴 **Cline Session Stopped**\n\n"
-                             "PTY session has been terminated.\n"
-                             "Use /start to begin a new session."
-                    )
-                    debug_log(DEBUG_INFO, "Session stop notification sent")
-                except Exception as e:
-                    debug_log(DEBUG_ERROR, "Failed to send session stop notification", 
-                             error_type=type(e).__name__, error=str(e))
+            async def notify():
+                await self._send_notification(
+                    AUTHORIZED_USER_ID,
+                    "🔴 **Cline Session Stopped**\n\nUse /start to begin a new session.",
+                    "Session stop notification sent",
+                    "Failed to send session stop notification"
+                )
             
             try:
                 loop = asyncio.get_event_loop()
-                loop.create_task(send_session_stop_notification())
+                loop.create_task(notify())
             except Exception as e:
-                debug_log(DEBUG_ERROR, "Failed to schedule session stop notification", 
-                         error_type=type(e).__name__, error=str(e))
+                debug_log(DEBUG_ERROR, "Failed to schedule notification", error=str(e))
 
-    def _cleanup_file_descriptors(self):
-        """Close file descriptors safely"""
-        if self.master_fd:
-            debug_log(DEBUG_DEBUG, "Closing master_fd", fd=self.master_fd)
-            try:
-                os.close(self.master_fd)
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Error closing master_fd", error=str(e))
-            self.master_fd = None
+    async def _send_notification(self, chat_id, message, success_log, error_log):
+        """Send a notification message with error handling"""
+        try:
+            await self.application.bot.send_message(chat_id=chat_id, text=message)
+            debug_log(DEBUG_INFO, success_log)
+        except Exception as e:
+            debug_log(DEBUG_ERROR, error_log, error=str(e))
 
-        if self.slave_fd:
-            debug_log(DEBUG_DEBUG, "Closing slave_fd", fd=self.slave_fd)
-            try:
-                os.close(self.slave_fd)
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Error closing slave_fd", error=str(e))
-            self.slave_fd = None
-
-    def _cleanup_resources(self):
-        """Comprehensive cleanup of all resources"""
-        debug_log(DEBUG_INFO, "Performing comprehensive cleanup")
-        
-        # Stop reading
-        self.stop_reading = True
-        
-        # Kill processes
-        if self.process:
-            self._kill_process_tree(self.process.pid)
-            self.process = None
-        
-        # Ensure clean state
-        self._ensure_session_clean()
-        
-        # Cleanup file descriptors
-        self._cleanup_file_descriptors()
-        
-        # Reset state
-        self.is_running = False
-        self.session_active = False
-        self.child_pids.clear()
-        
-        # Clear queues
-        self.output_queue.clear()
-        self.command_queue.clear()
-        
-        debug_log(DEBUG_DEBUG, "Cleanup complete")
+    async def _send_message(self, chat_id, text):
+        """Send a message to Telegram"""
+        try:
+            await self.application.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            debug_log(DEBUG_ERROR, "Failed to send message", error=str(e))
 
     def _output_reader(self):
         """Background thread to continuously read PTY output"""
         debug_log(DEBUG_INFO, "Output reader thread started")
-        
         read_count = 0
         error_count = 0
         
+        self.output_reader_healthy = True
+        self.last_reader_heartbeat = time.time()
+        
         while not self.stop_reading and self.is_running:
             try:
-                ready, _, _ = select.select([self.master_fd], [], [], 0.1)
+                self.last_reader_heartbeat = time.time()
                 
+                ready, _, _ = select.select([self.master_fd], [], [], 0.1)
                 if ready:
                     data = os.read(self.master_fd, 4096)
                     if data:
                         output = data.decode('utf-8', errors='replace')
                         read_count += 1
                         self._process_output(output)
+                        error_count = 0  # Reset error count on success
                     else:
-                        # EOF reached - process died
                         debug_log(DEBUG_WARN, "EOF received from PTY")
                         break
                 else:
-                    # Timeout, no data available
                     time.sleep(0.05)
-            except Exception as e:
+            except OSError as e:
                 error_count += 1
                 if error_count > 10:
-                    debug_log(DEBUG_ERROR, "Too many errors, stopping output reader")
+                    debug_log(DEBUG_ERROR, "Too many read errors, stopping output reader", error=str(e))
+                    break
+                time.sleep(0.1)
+            except Exception as e:
+                error_count += 1
+                debug_log(DEBUG_ERROR, "Unexpected error in output reader", error=str(e))
+                if error_count > 10:
                     break
                 time.sleep(0.1)
 
-        debug_log(DEBUG_INFO, "Output reader thread stopped", 
-                 total_reads=read_count, total_errors=error_count)
+        self.output_reader_healthy = False
+        debug_log(DEBUG_INFO, "Output reader thread stopped", total_reads=read_count, total_errors=error_count)
 
     def _process_output(self, output):
         """Process incoming output from Cline"""
         clean_output = strip_ansi_codes(output)
         
-        # Filter out Cline CLI UI prompts and repetitive UI elements
-        ui_indicators = [
-            '╭', '╰', '│', '┃', '╮', '╯',
-            'cline cli preview',
-            '/plan or /act',
-            'alt+enter',
-            'openrouter/xiaomi',
-            '~/cline-workspace',
-            'enter submit',
-            'new line',
-            'open editor',
-        ]
-        
+        ui_indicators = ['╭', '╰', '│', '┃', '╮', '╯', 'cline cli', '/plan or /act', 'alt+enter']
         ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
-        lines = clean_output.split('\n')
-        empty_lines = sum(1 for line in lines if not line.strip())
         
-        is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-        is_ui_heavy = ui_score >= 2 and not is_welcome_screen
-        is_ui_heavy = is_ui_heavy or (len(lines) > 0 and empty_lines / len(lines) > 0.5)
-        is_box_char = clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯']
+        is_welcome_screen = 'cline cli' in clean_output
         is_box_line = bool(re.match(r'^[\s│┃╭╰╮╯]+$', clean_output.strip()))
-        
-        api_patterns = [
-            r'## API request completed',
-            r'↑.*↓.*\$',
-            r'Tokens:.*Prompt:.*Completion:',
-            r'Cost:.*\$',
-            r'Elapsed:.*s',
-        ]
-        is_api_metadata = any(re.search(pattern, clean_output, re.IGNORECASE) for pattern in api_patterns)
-        
-        is_command_echo = False
-        if self.current_command:
-            if self.current_command not in ['/plan', '/act']:
-                echo_pattern = r'^[\s│┃]*' + re.escape(self.current_command) + r'[\s│┃]*$'
-                is_command_echo = bool(re.match(echo_pattern, clean_output.strip()))
-        
-        is_mode_switch_confirmation = False
-        if self.current_command in ['/plan', '/act']:
-            mode_indicators = ['switch to plan mode', 'switch to act mode', 'plan mode', 'act mode']
-            is_mode_switch_confirmation = any(indicator in clean_output.lower() for indicator in mode_indicators)
-        
-        if not is_welcome_screen and not is_mode_switch_confirmation and (is_ui_heavy or is_box_char or is_box_line or is_api_metadata or is_command_echo):
-            if clean_output.strip():
-                debug_log(DEBUG_DEBUG, "Filtered out UI/metadata/echo", 
-                         preview=clean_output[:30].replace('\n', '\\n'))
+        is_mode_switch = any(x in clean_output.lower() for x in ['switch to plan', 'switch to act', 'plan mode', 'act mode'])
+        is_mostly_empty_ui = (clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯'] or is_box_line) and len(clean_output.strip()) <= 3
+
+        if not is_welcome_screen and not is_mode_switch and is_mostly_empty_ui:
             return
         
-        if clean_output.strip() and len(clean_output) > 20:
-            debug_log(DEBUG_DEBUG, "Queued output", 
-                     preview=clean_output[:50].replace('\n', '\\n'))
-
+        # Detect interactive prompts
         prompt_patterns = [
-            r'\[y/N\]', r'\[Y/n\]', r'\(y/n\)', r'\(Y/N\)',
-            r'Continue\?', r'Proceed\?', r'Are you sure\?',
-            r'Enter .*:\s*$', r'Password:\s*$',
-            r'Press.*Enter.*to.*continue',
-            r'Press.*any.*key',
-            r'\[.*\]\s*$',
-            r'Press.*to.*exit',
-            r'Press.*to.*return',
+            r'\[y/N\]', r'\[Y/n\]', r'\(y/n\)', r'\(Y/N\)', r'Continue\?', r'Proceed\?',
+            r'Are you sure\?', r'Enter .*:\s*$', r'Password:\s*$', r'Press.*Enter.*to.*continue',
+            r'Press.*any.*key', r'\[.*\]\s*$', r'Press .*to exit', r'Press .* to return',
         ]
 
-        prompt_detected = False
         for pattern in prompt_patterns:
             if re.search(pattern, clean_output, re.IGNORECASE):
-                old_state = self.waiting_for_input
-                self.waiting_for_input = True
-                self.input_prompt = clean_output.strip()
-                prompt_detected = True
-                debug_log(DEBUG_INFO, "Interactive prompt detected", 
-                         pattern=pattern, prompt=self.input_prompt[:50],
-                         old_state=old_state, new_state=self.waiting_for_input)
+                with self.state_lock:
+                    self.waiting_for_input = True
+                    self.input_prompt = clean_output.strip()
+                    self.last_prompt_time = time.time()
+                debug_log(DEBUG_INFO, "Interactive prompt detected", pattern=pattern)
                 break
 
-        if not prompt_detected:
-            if re.search(r'[\[\(].*[\]\)]\s*$', clean_output.strip()):
-                old_state = self.waiting_for_input
+        if not self.waiting_for_input and re.search(r'[\[\(].*[\]\)]\s*$', clean_output.strip()):
+            with self.state_lock:
                 self.waiting_for_input = True
                 self.input_prompt = clean_output.strip()
-                prompt_detected = True
-                debug_log(DEBUG_INFO, "Detected continuation prompt", 
-                         prompt_preview=clean_output[:50])
 
-        if not prompt_detected and self.waiting_for_input:
-            debug_log(DEBUG_DEBUG, "Output received while waiting for input", 
-                     was_waiting=True)
-
-        self.output_queue.append(clean_output)
-        debug_log(DEBUG_DEBUG, "Output added to queue", 
-                 queue_size=len(self.output_queue), 
-                 waiting_for_input=self.waiting_for_input)
-
-        if len(self.output_queue) > 100:
-            self.output_queue.popleft()
-            debug_log(DEBUG_WARN, "Queue overflow, removing oldest entry")
+        with self.output_queue_lock:
+            self.output_queue.append(clean_output)
+            if len(self.output_queue) > 100:
+                self.output_queue.popleft()
+                debug_log(DEBUG_WARN, "Queue overflow, removing oldest entry")
 
     def send_command(self, command):
         """Send command to Cline"""
-        debug_log(DEBUG_INFO, "send_command called", command=command, is_running=self.is_running)
+        debug_log(DEBUG_INFO, "send_command called", command=command)
         
-        if not self.is_running:
-            debug_log(DEBUG_ERROR, "Cannot send command - PTY not running")
-            return "Error: PTY session not running"
+        with self.command_lock:
+            if not self.is_running:
+                debug_log(DEBUG_ERROR, "Cannot send command - PTY not running")
+                return "Error: PTY session not running"
 
-        try:
-            # CRITICAL FIX: Reset input state BEFORE sending command
-            old_waiting = self.waiting_for_input
-            old_prompt = self.input_prompt
-            self.waiting_for_input = False
-            self.input_prompt = ""
-            debug_log(DEBUG_DEBUG, "Reset input state", 
-                     old_waiting=old_waiting, old_prompt_preview=old_prompt[:30] if old_prompt else None,
-                     new_waiting=self.waiting_for_input)
+            current_time = time.time()
+            with self.state_lock:
+                if self.waiting_for_input and (current_time - self.last_prompt_time) > 30:
+                    debug_log(DEBUG_INFO, "Resetting stale waiting_for_input state")
+                    self.waiting_for_input = False
+                    self.input_prompt = ""
 
-            submission_methods = [
-                f"{command}\n",
-                f"{command}\r",
-                f"{command}\r\n",
-                f"{command}\x04",
-            ]
-            
-            for i, method in enumerate(submission_methods):
-                debug_log(DEBUG_DEBUG, f"Trying submission method {i+1}", 
-                         method_repr=repr(method), method_num=i+1)
-                
-                command_bytes = method.encode()
-                bytes_written = os.write(self.master_fd, command_bytes)
-                debug_log(DEBUG_DEBUG, f"Method {i+1} bytes written", 
-                         bytes_written=bytes_written, expected=len(command_bytes))
-                
-                time.sleep(0.3)
-                
-                if len(self.output_queue) > 0:
-                    debug_log(DEBUG_INFO, f"Success with method {i+1}", method_num=i+1)
-                    break
-            
-            self.current_command = command
-            
-            if self.process:
-                returncode = self.process.poll()
-                debug_log(DEBUG_DEBUG, "Subprocess status", 
-                         returncode=returncode, 
-                         alive=returncode is None)
-            
-            debug_log(DEBUG_INFO, "Command sent successfully", command=command)
-            return "Command sent"
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send command", 
-                     command=command, error_type=type(e).__name__, error=str(e),
-                     master_fd=self.master_fd, is_running=self.is_running,
-                     exc_info=True)
-            return f"Error sending command: {e}"
-
-    def send_enter(self):
-        """Send Enter key to dismiss continuation prompts"""
-        debug_log(DEBUG_INFO, "send_enter called")
-        
-        if not self.is_running:
-            debug_log(DEBUG_ERROR, "Cannot send Enter - PTY not running")
-            return False
-
-        try:
-            os.write(self.master_fd, b"\n")
-            debug_log(DEBUG_DEBUG, "Enter key sent")
-            time.sleep(0.2)
-            return True
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send Enter", 
-                     error_type=type(e).__name__, error=str(e))
-            return False
+                try:
+                    self.waiting_for_input = False
+                    self.input_prompt = ""
+                    
+                    os.write(self.master_fd, f"{command}\r\n".encode())
+                    time.sleep(0.2)
+                    self.current_command = command
+                    
+                    debug_log(DEBUG_INFO, "Command sent successfully", command=command)
+                    return "Command sent"
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, "Failed to send command", command=command, error=str(e))
+                    return f"Error sending command: {e}"
 
     def get_pending_output(self, max_length=4000):
-        """Get accumulated output, formatted for Telegram"""
-        queue_size = len(self.output_queue)
-        debug_log(DEBUG_DEBUG, "get_pending_output called", 
-                 queue_size=queue_size, max_length=max_length)
-        
-        if not self.output_queue:
-            debug_log(DEBUG_DEBUG, "No pending output")
-            return None
+        """Get accumulated output"""
+        with self.output_queue_lock:
+            if not self.output_queue:
+                return None
 
-        combined = ""
-        chunks_used = 0
-        original_queue_size = queue_size
-        
-        while self.output_queue and len(combined) < max_length:
-            chunk = self.output_queue.popleft()
-            if len(combined + chunk) > max_length:
-                self.output_queue.appendleft(chunk)
-                debug_log(DEBUG_DEBUG, "Hit max length limit", 
-                         combined_len=len(combined), chunk_len=len(chunk),
-                         remaining_in_queue=len(self.output_queue))
-                break
-            combined += chunk
-            chunks_used += 1
+            combined = ""
+            chunks_used = 0
+            
+            while self.output_queue and len(combined) < max_length:
+                chunk = self.output_queue.popleft()
+                if len(combined + chunk) > max_length:
+                    self.output_queue.appendleft(chunk)
+                    break
+                combined += chunk
+                chunks_used += 1
 
-        result = combined.strip() if combined else None
-        
-        debug_log(DEBUG_DEBUG, "Output prepared", 
-                 original_queue_size=original_queue_size,
-                 chunks_used=chunks_used,
-                 final_length=len(result) if result else 0,
-                 remaining_queue_size=len(self.output_queue),
-                 preview=(result[:50].replace('\n', '\\n') if result else None))
-        
-        return result
+            result = combined.strip() if combined else None
+            debug_log(DEBUG_DEBUG, "Output prepared", chunks_used=chunks_used, final_length=len(result) if result else 0)
+            return result
 
-    def is_waiting_for_input(self):
-        """Check if Cline is waiting for user input"""
-        return self.waiting_for_input
+    async def _ensure_session_active(self, update: Update) -> bool:
+        """Check if session is active"""
+        with self.state_lock:
+            if not self.session_active:
+                await update.message.reply_text("❌ No active session. Use /start first")
+                return False
+        return True
+
+    async def _command_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Generic command handler"""
+        debug_log(DEBUG_INFO, f"Processing {cmd} command")
+        
+        handlers = {
+            "/start": self._start,
+            "/stop": self._stop,
+            "/status": self._status,
+            "/cancel": self._cancel,
+            "/plan": self._mode_switch,
+            "/act": self._mode_switch,
+        }
+        
+        if cmd in handlers:
+            await handlers[cmd](update, context, cmd)
+
+    async def _start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /start"""
+        with self.state_lock:
+            if self.session_active:
+                await update.message.reply_text("ℹ️ Cline session already running")
+                return
+        
+        chat_id = update.effective_chat.id  # Capture immediately
+        
+        if self.start_pty_session(self.application):
+            await update.message.reply_text(
+                "✅ Cline session started\n\n**Bot Commands:**\n"
+                "• Natural language: `show me the current directory`\n"
+                "• CLI commands: `git status`, `ls`\n"
+                "• `/plan` - Plan mode\n• `/act` - Act mode\n• `/cancel` - Cancel task\n• `/status` - Check status\n• `/stop` - End session"
+            )
+            if not self._output_monitor_started:
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(output_monitor(self, self.application, chat_id))
+                    self._output_monitor_started = True
+                    debug_log(DEBUG_DEBUG, "Output monitor task created")
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, "Failed to create output monitor", error=str(e))
+        else:
+            await update.message.reply_text("❌ Failed to start Cline session")
+
+    async def _stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /stop"""
+        self.stop_pty_session(self.application)
+        await update.message.reply_text("🛑 Cline session stopped")
+
+    async def _status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /status"""
+        with self.state_lock:
+            status = "🟢 Running" if self.session_active else "🔴 Stopped"
+            waiting = " (waiting for input)" if self.waiting_for_input else ""
+            reader_status = "✓" if self.output_reader_healthy else "✗"
+        await update.message.reply_text(f"Status: {status}{waiting}\nReader: {reader_status}")
+
+    async def _cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /cancel - Send Ctrl+C to cancel current task"""
+        if not await self._ensure_session_active(update):
+            return
+        
+        await self._send_message(update.effective_chat.id, "🛑 Cancelling current task...")
+        
+        with self.command_lock:
+            try:
+                # Send Ctrl+C (0x03) directly to PTY
+                bytes_written = os.write(self.master_fd, b"\x03")
+                debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Failed to send Ctrl+C", error=str(e))
+                await self._send_message(update.effective_chat.id, f"❌ Failed to send cancel signal: {e}")
+                return
+
+    async def _mode_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Handle /plan and /act"""
+        if not await self._ensure_session_active(update):
+            return
+        mode = cmd[1:].upper()
+        await self._send_message(update.effective_chat.id, f"📋 Switched to **{mode} MODE**")
+        self.send_command(cmd)
+        await asyncio.sleep(0.5)
+        output = self.get_pending_output()
+        if output:
+            await self._send_message(update.effective_chat.id, output)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming Telegram messages"""
-        debug_log(DEBUG_INFO, "handle_message called")
-        
-        user_id = update.effective_user.id
+        """Handle incoming messages"""
+        if update.effective_user.id != AUTHORIZED_USER_ID:
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
         message_text = update.message.text.strip() if update.message.text else ""
+        self.last_chat_id = update.effective_chat.id
         
-        debug_log(DEBUG_DEBUG, "Message details", 
-                 user_id=user_id, 
-                 authorized_id=AUTHORIZED_USER_ID,
-                 message_text_preview=message_text[:50],
-                 message_length=len(message_text))
-
-        if user_id != AUTHORIZED_USER_ID:
-            debug_log(DEBUG_WARN, "Unauthorized access attempt", 
-                     user_id=user_id, authorized_id=AUTHORIZED_USER_ID)
-            await update.message.reply_text("❌ Unauthorized access")
-            return
-
-        debug_log(DEBUG_DEBUG, "Authorized user message", message_text=message_text)
-
-        # Special commands
-        if message_text == "/start":
-            debug_log(DEBUG_INFO, "Processing /start command", 
-                     session_active=self.session_active)
-            if not self.session_active:
-                if self.start_pty_session(self.application):
-                    debug_log(DEBUG_INFO, "/start: Session started successfully")
-                    await update.message.reply_text("✅ Cline session started\n\n**Bot Commands:**\n• Natural language: `show me the current directory`\n• CLI commands: `git status`, `ls`\n• `/plan` - Switch Cline to plan mode\n• `/act` - Switch Cline to act mode\n• `/cancel` - Cancel current task\n• `/status` - Check status\n• `/stop` - End session")
-                else:
-                    debug_log(DEBUG_ERROR, "/start: Failed to start session")
-                    await update.message.reply_text("❌ Failed to start Cline session")
-            else:
-                debug_log(DEBUG_INFO, "/start: Session already running")
-                await update.message.reply_text("ℹ️ Cline session already running")
-            return
-
-        if message_text == "/stop":
-            debug_log(DEBUG_INFO, "Processing /stop command")
-            self.stop_pty_session(self.application)
-            await update.message.reply_text("🛑 Cline session stopped")
-            return
-
-        if message_text == "/status":
-            debug_log(DEBUG_INFO, "Processing /status command")
-            status = "🟢 Running" if self.session_active else "🔴 Stopped"
-            waiting = " (waiting for input)" if self.is_waiting_for_input() else ""
-            debug_log(DEBUG_DEBUG, "Status check", 
-                     session_active=self.session_active, 
-                     waiting_for_input=self.is_waiting_for_input(),
-                     status=status)
-            await update.message.reply_text(f"Status: {status}{waiting}")
-            return
-
-        if message_text == "/cancel":
-            debug_log(DEBUG_INFO, "Processing /cancel command")
-            if self.session_active:
-                result = self.send_command("\x03")
-                debug_log(DEBUG_DEBUG, "Cancel signal sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="🛑 Cancel signal sent to Cline"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-            else:
-                await update.message.reply_text("❌ No active session to cancel")
-            return
-
-        if message_text == "/plan":
-            debug_log(DEBUG_INFO, "Processing /plan command")
-            if self.session_active:
-                result = self.send_command("/plan")
-                debug_log(DEBUG_DEBUG, "Plan mode switch sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="📋 Switched Cline to **PLAN MODE**"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-            else:
-                await update.message.reply_text("❌ No active session. Use /start first")
-            return
-
-        if message_text == "/act":
-            debug_log(DEBUG_INFO, "Processing /act command")
-            if self.session_active:
-                result = self.send_command("/act")
-                debug_log(DEBUG_DEBUG, "Act mode switch sent", result=result)
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="⚡ Switched Cline to **ACT MODE**"
-                )
-                
-                await asyncio.sleep(0.5)
-                output = self.get_pending_output()
-                debug_log(DEBUG_DEBUG, "After /act - queue size", 
-                         queue_size=len(self.output_queue), output=output)
-                if output:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=output
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="ℹ️ Command sent. Waiting for Cline response..."
-                    )
-            else:
-                await update.message.reply_text("❌ No active session. Use /start first")
+        # Command dispatch
+        if message_text.startswith('/'):
+            await self._command_handler(update, context, message_text)
             return
 
         # Handle interactive input
-        if self.is_waiting_for_input():
-            debug_log(DEBUG_INFO, "Processing interactive input", 
-                     waiting_for_input=self.waiting_for_input,
-                     prompt_preview=self.input_prompt[:50] if self.input_prompt else None)
-            
-            result = self.send_command(message_text)
-            debug_log(DEBUG_DEBUG, "Interactive input sent", 
-                     input=message_text, result=result)
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"📤 Input sent: {message_text}"
-            )
-
+        with self.state_lock:
+            waiting = self.waiting_for_input
+        
+        if waiting:
+            debug_log(DEBUG_INFO, "Processing interactive input")
+            self.send_command(message_text)
             await asyncio.sleep(0.5)
             output = self.get_pending_output()
             if output:
-                debug_log(DEBUG_DEBUG, "Interactive output received", 
-                         output_length=len(output))
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=output
-                )
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ Response complete"
-                )
-            else:
-                debug_log(DEBUG_DEBUG, "No output received after interactive input")
+                await self._send_message(update.effective_chat.id, output)
             return
 
         # Regular commands
-        if self.session_active:
-            debug_log(DEBUG_INFO, "Processing regular command", 
-                     command=message_text, session_active=self.session_active)
-            
-            # Enhanced debugging: Check state before sending command
-            debug_log(DEBUG_DEBUG, "State before command", 
-                     waiting_for_input=self.waiting_for_input,
-                     queue_size_before=len(self.output_queue),
-                     current_command=self.current_command)
-            
-            result = self.send_command(message_text)
-            
-            debug_log(DEBUG_DEBUG, "Command send result", 
-                     result=result,
-                     queue_size_after_send=len(self.output_queue))
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"📤 {result}"
-            )
-
-            is_long_running = any(keyword in message_text.lower() for keyword in ['run', 'build', 'install', 'download', 'clone'])
-            if is_long_running:
-                debug_log(DEBUG_INFO, "Long-running task detected", command=message_text)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="⏳ Long-running task started. Output will be sent as it becomes available..."
-                )
-
-            await asyncio.sleep(0.5)
-            
-            # Enhanced debugging: Check state before getting output
-            debug_log(DEBUG_DEBUG, "Before get_pending_output", 
-                     queue_size=len(self.output_queue),
-                     waiting_for_input=self.is_waiting_for_input())
-            
+        with self.state_lock:
+            active = self.session_active
+        
+        if active:
+            debug_log(DEBUG_INFO, "Processing regular command", command=message_text)
+            self.send_command(message_text)
+            await self._send_message(update.effective_chat.id, f"📤 Message sent: {message_text}")
+            await asyncio.sleep(2.0)
             output = self.get_pending_output()
-            
-            debug_log(DEBUG_DEBUG, "After get_pending_output", 
-                     got_output=bool(output),
-                     output_length=len(output) if output else 0,
-                     queue_size_after=len(self.output_queue),
-                     waiting_for_input_after=self.is_waiting_for_input())
-            
-            if not output and self.is_waiting_for_input():
-                debug_log(DEBUG_INFO, "No output but waiting for input, sending Enter to dismiss prompt")
-                self.send_enter()
-                await asyncio.sleep(0.3)
-                output = self.get_pending_output()
-                debug_log(DEBUG_DEBUG, "After Enter key, got output", 
-                         got_output=bool(output),
-                         output_length=len(output) if output else 0)
-            
             if output:
-                debug_log(DEBUG_DEBUG, "Immediate output received", output_length=len(output))
-                chunks = [output[i:i+4000] for i in range(0, len(output), 4000)]
-                debug_log(DEBUG_DEBUG, "Sending output in chunks", 
-                         total_chunks=len(chunks), total_length=len(output))
-                for i, chunk in enumerate(chunks):
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=chunk
-                    )
-                    debug_log(DEBUG_DEBUG, "Sent chunk", chunk_num=i+1, chunk_length=len(chunk))
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ Response complete"
-                )
-            else:
-                debug_log(DEBUG_DEBUG, "No immediate output, waiting for background reader")
-                # Enhanced: Check if queue is being populated by background thread
-                await asyncio.sleep(1)
-                queue_after_wait = len(self.output_queue)
-                debug_log(DEBUG_DEBUG, "Queue after 1 second wait", 
-                         queue_size=queue_after_wait)
-                if queue_after_wait > 0:
-                    debug_log(DEBUG_WARN, "Output appeared after delay - this suggests timing issue")
+                await self._send_message(update.effective_chat.id, output)
         else:
-            debug_log(DEBUG_WARN, "Command received but session not active", 
-                     message_text=message_text, session_active=self.session_active)
             await update.message.reply_text("❌ Cline session not running. Use /start first")
 
-async def output_monitor(bot_instance, application):
+async def output_monitor(bot_instance, application, chat_id):
     """Monitor for new output and send to user"""
     debug_log(DEBUG_INFO, "Output monitor started")
     iteration_count = 0
-    last_send_time = 0
-    RATE_LIMIT_SECONDS = 3
+    recent_messages = deque(maxlen=10)
     
     while True:
         iteration_count += 1
         if iteration_count % 30 == 0:
             debug_log(DEBUG_DEBUG, "Output monitor heartbeat", iterations=iteration_count)
         
-        if bot_instance.session_active and bot_instance.output_queue:
-            debug_log(DEBUG_DEBUG, "Output monitor found data", 
-                     queue_size=len(bot_instance.output_queue))
-            
-            current_time = time.time()
-            if current_time - last_send_time < RATE_LIMIT_SECONDS:
-                debug_log(DEBUG_DEBUG, "Rate limited, waiting", 
-                         time_since_last_send=current_time - last_send_time)
-                await asyncio.sleep(0.5)
-                continue
-            
+        if not chat_id:
+            await asyncio.sleep(2)
+            continue
+        
+        with bot_instance.state_lock:
+            active = bot_instance.session_active
+        
+        if active and bot_instance.output_queue:
             output = bot_instance.get_pending_output()
             if output:
                 clean_output = strip_ansi_codes(output)
-                
-                is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-                ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
+                lines = [l.strip() for l in clean_output.split('\n')]
+                lines = list(dict.fromkeys(lines))
+                clean_output = '\n'.join(lines)
+
+                ui_indicators = ['╭', '╰', '│', '┃', '/plan or /act']
                 ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
                 
-                if ui_score >= 2 and not is_welcome_screen:
-                    debug_log(DEBUG_DEBUG, "Filtered UI from monitor output", 
-                             ui_score=ui_score, output_length=len(clean_output))
+                normalized = ' '.join(clean_output.split())
+                msg_hash = hash(normalized)
+                is_cline_response = '###' in clean_output
+                is_repetitive_ui = ui_score >= 1 and '/plan or /act' in clean_output
+
+                should_filter = (
+                    msg_hash in recent_messages or
+                    (is_repetitive_ui and not is_cline_response) or
+                    (ui_score >= 2 and len(clean_output.strip()) <= 50)
+                )
+
+                if should_filter:
+                    debug_log(DEBUG_DEBUG, "Filtered message", ui_score=ui_score)
+                    if is_repetitive_ui:
+                        recent_messages.append(msg_hash)
+                    await asyncio.sleep(2)
                     continue
                 
-                debug_log(DEBUG_INFO, "Sending output to user", 
-                         output_length=len(clean_output))
+                debug_log(DEBUG_INFO, "Sending output to user", output_length=len(clean_output))
                 try:
-                    await application.bot.send_message(
-                        chat_id=AUTHORIZED_USER_ID,
-                        text=clean_output
-                    )
-                    last_send_time = current_time
-                    debug_log(DEBUG_DEBUG, "Output sent successfully")
+                    await application.bot.send_message(chat_id=chat_id, text=clean_output)
                 except Exception as e:
-                    debug_log(DEBUG_ERROR, "Error sending output", 
-                             error_type=type(e).__name__, error=str(e))
-            else:
-                debug_log(DEBUG_DEBUG, "No output after get_pending_output")
-        else:
-            if not bot_instance.session_active:
-                debug_log(DEBUG_DEBUG, "Output monitor: session not active")
-            elif not bot_instance.output_queue:
-                debug_log(DEBUG_DEBUG, "Output monitor: queue empty")
+                    debug_log(DEBUG_ERROR, "Error sending output", error=str(e))
 
         await asyncio.sleep(2)
 
-    debug_log(DEBUG_INFO, "Output monitor stopped")
+async def send_startup_message(app):
+    """Send startup notification"""
+    try:
+        await app.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text="🤖 **Cline Remote Chatter Bot Started**\n\n"
+                 "• PTY session management ready\n"
+                 "• Background output monitoring active\n\n"
+                 "Use /start to begin a Cline session"
+        )
+        debug_log(DEBUG_INFO, "Startup notification sent")
+    except Exception as e:
+        debug_log(DEBUG_ERROR, "Failed to send startup notification", error=str(e))
 
 def main():
     debug_log(DEBUG_INFO, "main() called")
     
-    debug_log(DEBUG_DEBUG, "Validating configuration", 
-             token_present=bool(TELEGRAM_BOT_TOKEN),
-             authorized_user_id=AUTHORIZED_USER_ID,
-             cline_command=CLINE_COMMAND)
-    
     if not TELEGRAM_BOT_TOKEN:
         debug_log(DEBUG_ERROR, "TELEGRAM_BOT_TOKEN not set")
-        print("ERROR: TELEGRAM_BOT_TOKEN environment variable is required")
         return
-    
-    if AUTHORIZED_USER_ID == 0:
-        debug_log(DEBUG_WARN, "AUTHORIZED_USER_ID not set or invalid")
 
     bot = ClineTelegramBot()
-    debug_log(DEBUG_DEBUG, "Bot instance created")
-
-    try:
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        debug_log(DEBUG_DEBUG, "Telegram application built")
-    except Exception as e:
-        debug_log(DEBUG_ERROR, "Failed to build Telegram application", 
-                 error_type=type(e).__name__, error=str(e))
-        return
-
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     bot.application = application
-    debug_log(DEBUG_DEBUG, "Application reference set in bot")
 
     application.add_handler(CommandHandler("start", bot.handle_message))
     application.add_handler(CommandHandler("stop", bot.handle_message))
@@ -951,100 +621,26 @@ def main():
     application.add_handler(CommandHandler("act", bot.handle_message))
     application.add_handler(CommandHandler("cancel", bot.handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    debug_log(DEBUG_DEBUG, "Message handlers added")
 
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(output_monitor(bot, application))
-        debug_log(DEBUG_DEBUG, "Output monitor task created")
-    except Exception as e:
-        debug_log(DEBUG_ERROR, "Failed to create output monitor task", 
-                 error_type=type(e).__name__, error=str(e))
+    async def post_init(app):
+        """Called after bot is initialized"""
+        await send_startup_message(app)
 
-    debug_log(DEBUG_INFO, "Bot starting with long-running task support")
-    print("Bot started with long-running task support")
-    
-    async def send_startup_notification():
-        try:
-            await application.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text="🤖 **Cline Remote Chatter Bot Started**\n\n"
-                     "• PTY session management ready\n"
-                     "• Background output monitoring active\n"
-                     "• Interactive command support enabled\n\n"
-                     "Use /start to begin a Cline session\n"
-                     "Use /status to check bot status\n"
-                     "Use /stop to end session"
-            )
-            debug_log(DEBUG_INFO, "Startup notification sent")
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send startup notification", 
-                     error_type=type(e).__name__, error=str(e))
+    application.post_init = post_init
 
-    async def send_shutdown_notification():
-        try:
-            await application.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text="🛑 **Cline Remote Chatter Bot Stopping**\n\n"
-                     "The bot is shutting down. All active sessions will be terminated."
-            )
-            debug_log(DEBUG_INFO, "Shutdown notification sent")
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send shutdown notification", 
-                     error_type=type(e).__name__, error=str(e))
-
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(send_startup_notification())
-    except Exception as e:
-        debug_log(DEBUG_ERROR, "Failed to schedule startup notification", 
-                 error_type=type(e).__name__, error=str(e))
-
-    try:
-        def signal_handler(signum, frame):
-            debug_log(DEBUG_INFO, f"Received signal {signum}, initiating shutdown")
-            try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_closed():
-                    loop.create_task(send_shutdown_notification())
-            except Exception as e:
-                debug_log(DEBUG_ERROR, "Failed to schedule shutdown notification", 
-                         error_type=type(e).__name__, error=str(e))
-            
+    def signal_handler(signum, frame):
+        debug_log(DEBUG_INFO, f"Received signal {signum}, shutting down")
+        with bot.state_lock:
             if bot.session_active:
-                debug_log(DEBUG_INFO, "Stopping active session due to shutdown")
                 bot.stop_pty_session()
-            
-            debug_log(DEBUG_INFO, "Bot shutting down")
-            import sys
-            sys.exit(0)
+        import sys
+        sys.exit(0)
 
-        import signal
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        debug_log(DEBUG_DEBUG, "Signal handlers registered")
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-        application.run_polling()
-        debug_log(DEBUG_INFO, "Bot polling started")
-    except Exception as e:
-        debug_log(DEBUG_ERROR, "Bot polling failed", 
-                 error_type=type(e).__name__, error=str(e), exc_info=True)
-        try:
-            loop = asyncio.get_event_loop()
-            if not loop.is_closed():
-                async def send_error_notification():
-                    try:
-                        await application.bot.send_message(
-                            chat_id=AUTHORIZED_USER_ID,
-                            text=f"❌ **Cline Bot Error**\n\nBot crashed with error:\n```\n{str(e)}\n```"
-                        )
-                    except:
-                        pass
-                loop.create_task(send_error_notification())
-        except:
-            pass
+    debug_log(DEBUG_INFO, "Bot starting")
+    application.run_polling()
 
 if __name__ == "__main__":
-    debug_log(DEBUG_INFO, "Script execution started")
     main()
-    debug_log(DEBUG_INFO, "Script execution ended")
