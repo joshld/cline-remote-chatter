@@ -1,7 +1,9 @@
 """
 Multi-Agent, Multi-Chat Interface Architecture
-Pragmatic design: Works WITH telegram-bot library, not against it
-Supports: Any CLI agent (Cline, Codex, etc) + Any chat service (Telegram, Discord, etc)
+Supports:
+  - PTY-based agents (Cline, Codex CLI, etc) 
+  - Agent Client Protocol (ACP) agents (Claude, etc)
+  - Any chat service (Telegram, Discord, etc)
 """
 
 import asyncio
@@ -19,6 +21,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, Any, Callable
 import json
+import httpx
 
 import psutil
 from dotenv import load_dotenv
@@ -50,7 +53,7 @@ def strip_ansi_codes(text):
 
 
 # ============================================================================
-# MESSAGE/EVENT TYPES (Simplified)
+# MESSAGE TYPES
 # ============================================================================
 
 class MessageType(Enum):
@@ -58,6 +61,8 @@ class MessageType(Enum):
     AGENT_OUTPUT = "agent_output"
     COMMAND = "command"
     ERROR = "error"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
 
 
 class Message:
@@ -71,11 +76,11 @@ class Message:
 
 
 # ============================================================================
-# AGENT INTERFACE
+# ABSTRACT AGENT INTERFACE
 # ============================================================================
 
 class AgentInterface(ABC):
-    """Abstract interface for CLI-based agents"""
+    """Abstract interface for any AI agent"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -93,8 +98,8 @@ class AgentInterface(ABC):
         pass
 
     @abstractmethod
-    def send_command(self, command: str) -> str:
-        """Send command to agent (synchronous)"""
+    async def send_command(self, command: str) -> str:
+        """Send command/message to agent"""
         pass
 
     @abstractmethod
@@ -106,12 +111,16 @@ class AgentInterface(ABC):
         return self.is_running_flag
 
 
+# ============================================================================
+# PTY-BASED AGENTS (Cline, Codex CLI, etc)
+# ============================================================================
+
 class PTYAgent(AgentInterface):
-    """PTY-based CLI agent (Cline, Codex, etc)"""
+    """Base class for PTY-based CLI agents"""
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.command = config.get("command", ["cline"])
+        self.command = config.get("command", ["agent"])
         self.name = config.get("name", "Agent")
         
         self.master_fd = None
@@ -155,36 +164,15 @@ class PTYAgent(AgentInterface):
         debug_log(DEBUG_INFO, f"{self.name} output reader stopped")
 
     def _process_output(self, output: str):
-        """Process output and detect prompts"""
+        """Process output and detect prompts - override in subclasses for custom filtering"""
         clean_output = strip_ansi_codes(output)
-        agent_config = self.config
 
-        # Welcome screen detection (configurable)
-        welcome_keywords = agent_config.get("welcome_keywords", ["cline cli"])
-        is_welcome_screen = any(keyword in clean_output.lower() for keyword in welcome_keywords)
-
-        # Mode switching detection (configurable)
-        mode_keywords = agent_config.get("mode_keywords", ["switch to plan", "switch to act", "plan mode", "act mode"])
-        is_mode_switch = any(keyword in clean_output.lower() for keyword in mode_keywords)
-
-        # UI element filtering
-        is_box_line = bool(re.match(r"^[\s│┃╭╰╮╯]+$", clean_output.strip()))
-        is_mostly_empty_ui = (clean_output.strip() in ["╭", "╰", "│", "┃", "╮", "╯"] or is_box_line) and len(clean_output.strip()) <= 3
-
-        if not is_welcome_screen and not is_mode_switch and is_mostly_empty_ui:
-            debug_log(DEBUG_DEBUG, f"Filtered UI message: {repr(clean_output)}", reason="mostly_empty_ui")
+        # Apply agent-specific filtering
+        if self._should_filter_output(clean_output):
             return
 
         # Detect interactive prompts
-        prompt_patterns = [
-            r"\[y/N\]\s*$", r"\[Y/n\]\s*$", r"\(y/n\)\s*$", r"\(Y/N\)\s*$",
-            r"Continue\?\s*$", r"Proceed\?\s*$", r"Are you sure\?\s*$",
-            r"Enter .*:\s*$", r"Password:\s*$",
-            r"Press.*Enter.*to.*continue\s*$", r"Press.*any.*key\s*$",
-            r"\[.*\]\s*$", r"Press .*to exit\s*$", r"Press .* to return\s*$",
-        ]
-
-        for pattern in prompt_patterns:
+        for pattern in self._get_prompt_patterns():
             if re.search(pattern, clean_output, re.IGNORECASE):
                 with self.state_lock:
                     self.waiting_for_input = True
@@ -195,6 +183,20 @@ class PTYAgent(AgentInterface):
 
         with self.output_queue_lock:
             self.output_queue.append(clean_output)
+
+    def _should_filter_output(self, output: str) -> bool:
+        """Override in subclasses to implement custom filtering. Return True to filter."""
+        return False
+
+    def _get_prompt_patterns(self) -> list:
+        """Override in subclasses for custom prompt detection patterns"""
+        return [
+            r"\[y/N\]\s*$", r"\[Y/n\]\s*$", r"\(y/n\)\s*$", r"\(Y/N\)\s*$",
+            r"Continue\?\s*$", r"Proceed\?\s*$", r"Are you sure\?\s*$",
+            r"Enter .*:\s*$", r"Password:\s*$",
+            r"Press.*Enter.*to.*continue\s*$", r"Press.*any.*key\s*$",
+            r"\[.*\]\s*$", r"Press .*to exit\s*$", r"Press .* to return\s*$",
+        ]
 
     async def start(self) -> bool:
         """Start the agent"""
@@ -240,8 +242,8 @@ class PTYAgent(AgentInterface):
             except:
                 pass
 
-    def send_command(self, command: str) -> str:
-        """Send command to agent (SYNCHRONOUS for telegram-bot compatibility)"""
+    async def send_command(self, command: str) -> str:
+        """Send command to agent"""
         with self.command_lock:
             if not self.is_running_flag:
                 return "Error: Agent not running"
@@ -273,26 +275,302 @@ class PTYAgent(AgentInterface):
                 combined += chunk
 
             if combined.strip():
-                return Message(
-                    MessageType.AGENT_OUTPUT,
-                    combined.strip(),
-                    sender=self.name
-                )
+                return Message(MessageType.AGENT_OUTPUT, combined.strip(), sender=self.name)
             return None
 
 
 # ============================================================================
-# BRIDGE - Works WITH telegram-bot library
+# CONCRETE PTY AGENTS
+# ============================================================================
+
+class ClineAgent(PTYAgent):
+    """Cline CLI agent with custom filtering"""
+
+    def __init__(self, config: Dict[str, Any]):
+        config.setdefault("name", "Cline")
+        config.setdefault("command", ["cline"])
+        super().__init__(config)
+        self._message_ui_scores = {}  # Track UI scores for filtering
+
+    def _should_filter_output(self, output: str) -> bool:
+        """Cline-specific output filtering at the PTY level"""
+        welcome_keywords = self.config.get("welcome_keywords", ["cline cli"])
+        is_welcome_screen = any(keyword in output.lower() for keyword in welcome_keywords)
+
+        mode_keywords = self.config.get("mode_keywords", ["switch to plan", "switch to act", "plan mode", "act mode"])
+        is_mode_switch = any(keyword in output.lower() for keyword in mode_keywords)
+
+        is_box_line = bool(re.match(r"^[\s│┃╭╰╮╯]+$", output.strip()))
+        is_mostly_empty_ui = (output.strip() in ["╭", "╰", "│", "┃", "╮", "╯"] or is_box_line) and len(output.strip()) <= 3
+
+        return not is_welcome_screen and not is_mode_switch and is_mostly_empty_ui
+
+    def _should_filter_message(self, content: str) -> bool:
+        """Cline-specific message-level filtering for UI spam and duplicates"""
+        # Count UI indicators
+        ui_indicators = ["╭", "╰", "│", "┃", "/plan or /act"]
+        ui_score = sum(1 for indicator in ui_indicators if indicator in content)
+
+        # Check for Cline responses
+        is_cline_response = "###" in content
+
+        # Check for repetitive UI
+        is_repetitive_ui = ui_score >= 1 and "/plan or /act" in content
+
+        # Calculate if message is mostly UI
+        ui_ratio = ui_score / max(1, len(content.split()))
+        is_mostly_ui = ui_ratio > 0.3 or (ui_score >= 2 and len(content.strip()) <= 100)
+
+        # High UI score filter
+        high_ui_score = ui_score >= 3 and len(content.strip()) <= 50
+
+        # Should filter if: repetitive UI that's mostly UI and not a response, OR high UI score
+        should_filter = (
+            (is_repetitive_ui and not is_cline_response and is_mostly_ui) or
+            high_ui_score
+        )
+
+        if should_filter:
+            debug_log(DEBUG_DEBUG, f"Filtered Cline message: UI score {ui_score}, ratio {ui_ratio:.2f}, mostly_ui: {is_mostly_ui}")
+
+        return should_filter
+
+
+class CodexCLIAgent(PTYAgent):
+    """Codex CLI agent - PTY-based (runs locally as subprocess)"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        config.setdefault("name", "Codex CLI")
+        config.setdefault("command", ["codex"])
+        super().__init__(config)
+
+    def _should_filter_output(self, output: str) -> bool:
+        """Codex-specific filtering if needed"""
+        # Implement Codex-specific filtering here
+        return False
+
+
+# ============================================================================
+# ACP-BASED AGENTS
+# ============================================================================
+
+class ACPAgent(AgentInterface):
+    """Agent Client Protocol (ACP) based agent"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.api_url = config.get("api_url")
+        self.api_key = config.get("api_key")
+        self.model = config.get("model", "claude-3-5-sonnet-20241022")
+        self.name = config.get("name", "ACP Agent")
+        
+        self.conversation_history = []
+        self.output_queue = deque(maxlen=50)
+        self.output_queue_lock = threading.Lock()
+        
+    async def start(self) -> bool:
+        """Start ACP agent (no process to start)"""
+        self.is_running_flag = True
+        self.conversation_history = []
+        debug_log(DEBUG_INFO, f"{self.name} ACP session started")
+        return True
+
+    async def stop(self) -> None:
+        """Stop ACP agent"""
+        self.is_running_flag = False
+        self.conversation_history = []
+        debug_log(DEBUG_INFO, f"{self.name} ACP session stopped")
+
+    async def send_command(self, command: str) -> str:
+        """Send message to ACP agent via API"""
+        if not self.is_running_flag:
+            return "Error: Agent not running"
+
+        try:
+            # Add user message to history
+            self.conversation_history.append({
+                "role": "user",
+                "content": command
+            })
+
+            # Call ACP API
+            response = await self._call_api(self.conversation_history)
+            
+            if response:
+                # Add assistant response to history
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": response
+                })
+                
+                # Queue output
+                with self.output_queue_lock:
+                    self.output_queue.append(response)
+                
+                return "Message sent"
+            else:
+                return "Error: No response from agent"
+                
+        except Exception as e:
+            debug_log(DEBUG_ERROR, f"Failed to send message to {self.name}: {e}")
+            return f"Error: {e}"
+
+    async def _call_api(self, messages: list) -> Optional[str]:
+        """Call the ACP API endpoint"""
+        raise NotImplementedError("Subclasses must implement _call_api")
+
+    async def get_output(self) -> Optional[Message]:
+        """Get pending output"""
+        with self.output_queue_lock:
+            if not self.output_queue:
+                return None
+
+            combined = ""
+            while self.output_queue and len(combined) < 4000:
+                chunk = self.output_queue.popleft()
+                combined += chunk + "\n"
+
+            if combined.strip():
+                return Message(MessageType.AGENT_OUTPUT, combined.strip(), sender=self.name)
+            return None
+
+
+# ============================================================================
+# CONCRETE ACP AGENTS
+# ============================================================================
+
+class ClaudeAAPIAgent(ACPAgent):
+    """Claude via Anthropic API (ACP-compatible)"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        config.setdefault("name", "Claude API")
+        config.setdefault("api_url", "https://api.anthropic.com/v1/messages")
+        super().__init__(config)
+
+    async def _call_api(self, messages: list) -> Optional[str]:
+        """Call Claude API"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    self.api_url,
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "max_tokens": 1024,
+                        "messages": messages,
+                    },
+                    timeout=30.0,
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("content"):
+                        return data["content"][0]["text"]
+                else:
+                    debug_log(DEBUG_ERROR, f"API error: {response.status_code} - {response.text}")
+                    return None
+        except Exception as e:
+            debug_log(DEBUG_ERROR, f"Failed to call Claude API: {e}")
+            return None
+
+
+class OpenAIAPIAgent(ACPAgent):
+    """OpenAI via OpenAI API (ACP-compatible)"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        config.setdefault("name", "OpenAI API")
+        config.setdefault("api_url", "https://api.openai.com/v1/chat/completions")
+        config.setdefault("model", "gpt-4-turbo")
+        super().__init__(config)
+
+    async def _call_api(self, messages: list) -> Optional[str]:
+        """Call OpenAI API"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    self.api_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "max_tokens": 1024,
+                    },
+                    timeout=30.0,
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("choices"):
+                        return data["choices"][0]["message"]["content"]
+                else:
+                    debug_log(DEBUG_ERROR, f"API error: {response.status_code} - {response.text}")
+                    return None
+        except Exception as e:
+            debug_log(DEBUG_ERROR, f"Failed to call OpenAI API: {e}")
+            return None
+
+
+class CodexAPIAgent(ACPAgent):
+    """Codex via API (ACP-compatible) - if running with --api-server"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        config.setdefault("name", "Codex API")
+        config.setdefault("api_url", "http://localhost:8000/v1/messages")
+        super().__init__(config)
+
+    async def _call_api(self, messages: list) -> Optional[str]:
+        """Call Codex API endpoint"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    self.api_url,
+                    headers={
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "messages": messages,
+                        "max_tokens": 2048,
+                    },
+                    timeout=60.0,
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # Parse based on Codex API response format
+                    if data.get("content"):
+                        return data["content"][0]["text"]
+                    elif data.get("message"):
+                        return data["message"]
+                    else:
+                        return str(data)
+                else:
+                    debug_log(DEBUG_ERROR, f"Codex API error: {response.status_code} - {response.text}")
+                    return None
+        except Exception as e:
+            debug_log(DEBUG_ERROR, f"Failed to call Codex API: {e}")
+            return None
+
+
+# ============================================================================
+# BRIDGE
 # ============================================================================
 
 class AgentChatBridge:
-    """Bridges agent and Telegram with minimal async complexity"""
+    """Bridges agent and Telegram"""
 
     def __init__(self, agent: AgentInterface, app: Application, user_id: str):
         self.agent = agent
         self.app = app
         self.user_id = user_id
         self.output_monitor_task = None
+        self._recent_hashes = deque(maxlen=10)  # For duplicate filtering
 
     async def send_message(self, user_id: str, text: str) -> None:
         """Send message to user"""
@@ -316,17 +594,15 @@ class AgentChatBridge:
 
             if await self.agent.start():
                 await update.message.reply_text(
-                    "✅ Agent started\n\n"
-                    "Commands:\n"
-                    "• Natural language: `show me the current directory`\n"
-                    "• CLI commands: `git status`, `ls`\n"
+                    f"✅ {self.agent.name} started\n\n"
+                    "Send messages to interact with the agent\n"
                     "• `/stop` - Stop agent\n"
                     "• `/status` - Check status"
                 )
                 if not self.output_monitor_task:
                     self.output_monitor_task = asyncio.create_task(self._output_monitor())
             else:
-                await update.message.reply_text("❌ Failed to start agent")
+                await update.message.reply_text(f"❌ Failed to start {self.agent.name}")
 
         elif cmd == "/stop":
             await self.agent.stop()
@@ -335,7 +611,7 @@ class AgentChatBridge:
         elif cmd == "/status":
             status = "🟢 Running" if self.agent.is_running() else "🔴 Stopped"
             waiting = "\n⏸️ Waiting for input" if self.agent.waiting_for_input else ""
-            await update.message.reply_text(f"Status: {status}{waiting}")
+            await update.message.reply_text(f"Status: {status}{waiting}\nAgent: {self.agent.name}")
 
     async def handle_message(self, update, context):
         """Handle regular messages"""
@@ -344,23 +620,22 @@ class AgentChatBridge:
             return
 
         if not self.agent.is_running():
-            await update.message.reply_text("❌ Agent not running. Use /start")
+            await update.message.reply_text(f"❌ {self.agent.name} not running. Use /start")
             return
 
         message_text = update.message.text.strip()
-
-        # Send command to agent (synchronous)
-        self.agent.send_command(message_text)
-        await update.message.reply_text(f"📤 Command sent: {message_text}")
-
-        # Wait for output
-        await asyncio.sleep(2.0)
+        
+        await update.message.reply_text(f"📤 Message sent...")
+        
+        await self.agent.send_command(message_text)
+        await asyncio.sleep(1.0)
+        
         output = await self.agent.get_output()
         if output:
             await update.message.reply_text(output.content)
 
     async def _output_monitor(self) -> None:
-        """Monitor for new output"""
+        """Monitor for new output with sophisticated filtering"""
         debug_log(DEBUG_INFO, "Output monitor started")
         recent_messages = deque(maxlen=10)
 
@@ -368,48 +643,38 @@ class AgentChatBridge:
             try:
                 output = await self.agent.get_output()
                 if output:
-                    clean_output = strip_ansi_codes(output.content)
-                    lines = [line.strip() for line in clean_output.split("\n")]
-                    lines = list(dict.fromkeys(lines))
-                    clean_output = "\n".join(lines)
-
-                    # Sophisticated UI filtering
-                    agent_config = self.agent.config
-                    ui_indicators = agent_config.get("ui_indicators", ["╭", "╰", "│", "┃", "/plan or /act"])
-                    ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
-
-                    normalized = " ".join(clean_output.split())
-                    msg_hash = hash(normalized)
-
-                    response_markers = agent_config.get("response_markers", ["###"])
-                    is_agent_response = any(marker in clean_output for marker in response_markers)
-
-                    repetitive_ui_markers = agent_config.get("repetitive_ui_markers", ["/plan or /act"])
-                    is_repetitive_ui = ui_score >= 1 and any(marker in clean_output for marker in repetitive_ui_markers)
-
-                    ui_ratio = ui_score / max(1, len(clean_output.split()))
-                    is_mostly_ui = ui_ratio > 0.3 or (ui_score >= 2 and len(clean_output.strip()) <= 100)
-
-                    should_filter = (
-                        msg_hash in recent_messages
-                        or (is_repetitive_ui and not is_agent_response and is_mostly_ui)
-                        or (ui_score >= 3 and len(clean_output.strip()) <= 50)
-                    )
-
-                    if should_filter:
-                        if is_repetitive_ui:
-                            recent_messages.append(msg_hash)
-                        await asyncio.sleep(2)
-                        continue
-
-                    debug_log(DEBUG_INFO, "Sending output to user", output_length=len(clean_output))
-                    await self.send_message(self.user_id, clean_output)
-                    recent_messages.append(msg_hash)
-
+                    # Apply agent-specific filtering
+                    filtered_output = self._filter_output(output)
+                    if filtered_output:
+                        debug_log(DEBUG_INFO, "Sending filtered output to user", output_length=len(filtered_output.content))
+                        await self.send_message(self.user_id, filtered_output.content)
                 await asyncio.sleep(2)
             except Exception as e:
                 debug_log(DEBUG_ERROR, f"Output monitor error: {e}")
                 await asyncio.sleep(2)
+
+    def _filter_output(self, output: Message) -> Optional[Message]:
+        """Apply sophisticated filtering to prevent duplicates and UI spam"""
+        clean_content = strip_ansi_codes(output.content)
+
+        # Remove duplicate lines within message
+        lines = [line.strip() for line in clean_content.split("\n")]
+        lines = list(dict.fromkeys(lines))  # Remove duplicates
+        clean_content = "\n".join(lines)
+
+        # Agent-specific UI filtering
+        if hasattr(self.agent, '_should_filter_message'):
+            if self.agent._should_filter_message(clean_content):
+                return None
+
+        # Global duplicate message filtering
+        msg_hash = hash(clean_content)
+        if msg_hash in self._recent_hashes:
+            debug_log(DEBUG_DEBUG, "Filtered duplicate message")
+            return None
+        self._recent_hashes.append(msg_hash)
+
+        return Message(output.type, clean_content, output.sender, output.metadata)
 
 
 # ============================================================================
@@ -419,12 +684,32 @@ class AgentChatBridge:
 load_dotenv()
 
 
+def create_agent(agent_type: str, config: Dict[str, Any]) -> AgentInterface:
+    """Factory function to create agents"""
+    agents = {
+        # PTY agents (run locally as subprocess)
+        "cline": ClineAgent,
+        "codex-cli": CodexCLIAgent,
+        
+        # ACP agents (call remote API)
+        "claude-api": ClaudeAAPIAgent,
+        "openai-api": OpenAIAPIAgent,
+        "codex-api": CodexAPIAgent,
+    }
+    
+    if agent_type not in agents:
+        raise ValueError(f"Unknown agent type: {agent_type}")
+    
+    return agents[agent_type](config)
+
+
 def main():
     """Main entry point"""
     debug_log(DEBUG_INFO, "Starting Agent-Chat Bridge")
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     user_id = os.getenv("AUTHORIZED_USER_ID")
+    agent_type = os.getenv("AGENT_TYPE", "cline")
 
     if not token or not user_id:
         debug_log(DEBUG_ERROR, "TELEGRAM_BOT_TOKEN and AUTHORIZED_USER_ID must be set in .env")
@@ -436,16 +721,39 @@ def main():
         debug_log(DEBUG_ERROR, f"User ID '{user_id}' must be numeric")
         return
 
-    # Initialize agent
-    agent = PTYAgent({
-        "command": ["cline"],
-        "name": "Cline",
-        "welcome_keywords": ["cline cli"],
-        "mode_keywords": ["switch to plan", "switch to act", "plan mode", "act mode"],
-        "ui_indicators": ["╭", "╰", "│", "┃", "/plan or /act"],
-        "response_markers": ["###"],
-        "repetitive_ui_markers": ["/plan or /act"]
-    })
+    # Create agent based on type
+    agent_config = {
+        "cline": {
+            "command": ["cline"],
+            "name": "Cline",
+            "welcome_keywords": ["cline cli"],
+            "mode_keywords": ["switch to plan", "switch to act", "plan mode", "act mode"],
+        },
+        "codex-cli": {
+            "command": ["codex"],
+            "name": "Codex CLI",
+        },
+        "codex-api": {
+            "api_url": os.getenv("CODEX_API_URL", "http://localhost:8000/v1/messages"),
+            "name": "Codex API",
+        },
+        "claude-api": {
+            "api_key": os.getenv("ANTHROPIC_API_KEY"),
+            "model": "claude-3-5-sonnet-20241022",
+            "name": "Claude API",
+        },
+        "openai-api": {
+            "api_key": os.getenv("OPENAI_API_KEY"),
+            "model": "gpt-4-turbo",
+            "name": "OpenAI",
+        },
+    }
+
+    if agent_type not in agent_config:
+        debug_log(DEBUG_ERROR, f"Agent type '{agent_type}' not configured. Available: {list(agent_config.keys())}")
+        return
+
+    agent = create_agent(agent_type, agent_config[agent_type])
 
     # Initialize Telegram application
     application = Application.builder().token(token).build()
@@ -462,8 +770,7 @@ def main():
         try:
             await app.bot.send_message(
                 chat_id=int(user_id),
-                text="🤖 **Agent-Chat Bridge Started**\n\n"
-                "Use /start to begin an agent session"
+                text=f"🤖 **Agent-Chat Bridge Started**\n\nAgent: {agent.name}\nUse /start to begin"
             )
             debug_log(DEBUG_INFO, "Startup message sent")
         except Exception as e:
@@ -480,7 +787,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    debug_log(DEBUG_INFO, "Starting polling")
+    debug_log(DEBUG_INFO, f"Starting with {agent.name} ({agent_type})")
     application.run_polling()
 
 
