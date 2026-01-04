@@ -1,0 +1,11 @@
+[Unit]
+Description=Run health check for Cline Telegram Bot every 5 minutes
+Requires=cline-telegram-bot.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

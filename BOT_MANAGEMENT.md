@@ -1,5 +1,7 @@
 # Telegram Bot Management Guide
 
+**📁 For comprehensive daemon scripts and production deployment options, see the `scripts/` directory and `scripts/README.md`.**
+
 ## Starting the Bot
 
 ### Basic Start (foreground)
@@ -7,9 +9,15 @@
 python3 cline_telegram_bot.py
 ```
 
-### Background Mode (recommended)
+### Background Mode (simple)
 ```bash
 nohup python3 cline_telegram_bot.py > bot.log 2>&1 &
+```
+
+### Background Mode with Auto-Restart (recommended)
+```bash
+# Use the daemon script for better process management
+python3 scripts/quick_start.py monitor
 ```
 
 ### Check if Running
@@ -95,42 +103,47 @@ Once the bot is running, you can use these Telegram commands:
 - `/status` - Check session status
 - Any text message - Send command to Cline
 
-## Systemd Service (Advanced)
+## Production Deployment Options
 
-For production use, create a systemd service:
+For production use, use the pre-configured systemd service and monitoring scripts in the `scripts/` directory:
 
+### Systemd Service (Recommended for Production)
 ```bash
-sudo nano /etc/systemd/system/cline-telegram-bot.service
-```
+# 1. Configure paths in the service file
+nano scripts/cline-bot.service
+# Update all path placeholders for your environment
 
-Add this content:
-```ini
-[Unit]
-Description=Cline Telegram Bot Service
-After=network.target
-
-[Service]
-User=user_name
-WorkingDirectory=/home/user_name/workspace/cutesy-agent-router
-Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 /home/user_name/workspace/cutesy-agent-router/cline_telegram_bot.py
-Restart=always
-RestartSec=5
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=cline-telegram-bot
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start:
-```bash
+# 2. Copy and enable service
+sudo cp scripts/cline-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable cline-telegram-bot
 sudo systemctl start cline-telegram-bot
+
+# 3. Check status
 sudo systemctl status cline-telegram-bot
 ```
+
+### Python Daemon with Auto-Restart (Recommended for Development)
+```bash
+# Start with automatic crash recovery
+python3 scripts/quick_start.py monitor
+
+# Manual control
+python3 scripts/quick_start.py start   # Start once
+python3 scripts/quick_start.py stop    # Stop bot
+python3 scripts/quick_start.py status  # Check status
+```
+
+### Health Monitoring (Optional)
+```bash
+# Enable automatic health checks every 5 minutes
+sudo cp scripts/bot-healthcheck.sh /usr/local/bin/
+sudo cp scripts/bot-healthcheck.timer /etc/systemd/system/
+sudo systemctl enable bot-healthcheck.timer
+sudo systemctl start bot-healthcheck.timer
+```
+
+See `scripts/README.md` for complete setup instructions and path configuration.
 
 ## Troubleshooting
 
@@ -150,7 +163,11 @@ pkill -9 -f "cline_telegram_bot.py"
 
 #### 3. Start Fresh
 ```bash
+# Option 1: Simple background
 nohup python3 cline_telegram_bot.py > bot.log 2>&1 &
+
+# Option 2: Managed daemon (recommended)
+python3 scripts/quick_start.py start
 ```
 
 #### 4. Verify It's Running
@@ -186,11 +203,17 @@ echo "Restarting Cline Telegram Bot..."
 pkill -9 -f "cline_telegram_bot.py" 2>/dev/null
 sleep 2
 > bot.log
-nohup python3 cline_telegram_bot.py > bot.log 2>&1 &
+python3 scripts/quick_start.py start  # Use managed daemon
 sleep 3
 echo "Bot restarted. Check status:"
-ps aux | grep cline_telegram_bot | grep -v grep
-echo "View logs: tail -f bot.log"
+python3 scripts/quick_start.py status
+echo "View logs: python3 scripts/quick_start.py logs"
+```
+
+### Managed Restart (Better)
+```bash
+# Use the built-in restart functionality
+python3 scripts/quick_start.py restart
 ```
 
 ### Kill All Cline Processes (One-Liner)
@@ -201,7 +224,9 @@ pkill -9 -f "cline" && pkill -9 -f "cline-host" && pkill -9 -f "cline-core"
 ## Notes
 
 - The bot runs continuously in the background
-- Logs are saved to `bot.log`
-- Use `tail -f bot.log` to monitor in real-time
-- The bot automatically restarts if it crashes (with nohup)
-- For production, use the systemd service method
+- Logs are saved to `bot.log` (and `monitor.log` for daemon monitoring)
+- Use `python3 scripts/quick_start.py logs` or `tail -f bot.log` to monitor
+- Daemon scripts provide automatic restart on crashes
+- For production, use the systemd service from `scripts/cline-bot.service`
+- For development, use `python3 scripts/quick_start.py monitor`
+- See `scripts/README.md` for complete deployment options

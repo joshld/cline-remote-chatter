@@ -1,0 +1,40 @@
+[Unit]
+Description=Cline Telegram Bot Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=user_name
+Group=group_name
+# Update these paths for your environment:
+WorkingDirectory=/path/to/your/cutesy-agent-router
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/path/to/your/cutesy-agent-router"
+ExecStart=/usr/bin/python3 /path/to/your/cutesy-agent-router/cline_telegram_bot.py
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart configuration
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline-telegram-bot
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/path/to/your/cutesy-agent-router  # Update this path
+PrivateTmp=yes
+
+# Resource limits
+MemoryLimit=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
