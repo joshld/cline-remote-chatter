@@ -86,6 +86,7 @@ class AgentInterface(ABC):
         self.config = config
         self.is_running_flag = False
         self.waiting_for_input = False
+        self.command_timeout = config.get("command_timeout", 30.0)  # Default 30 seconds
 
     @abstractmethod
     async def start(self) -> bool:
@@ -657,6 +658,8 @@ class AgentChatBridge:
         self._last_message_time = {}  # user_id -> timestamp
         self._rate_limit_ms = 500  # Minimum 500ms between messages
         self._max_message_length = 10000  # Max 10,000 characters
+        self._rate_limit_cleanup_interval = 3600  # Clean every hour
+        self._last_cleanup = time.time()
 
     async def initialize(self) -> None:
         """Initialize bridge - get custom commands from agent"""
@@ -908,6 +911,17 @@ class AgentChatBridge:
         user_id = str(update.effective_user.id)
         current_time = time.time()
 
+        # Periodic cleanup of stale rate limit entries (prevents memory leak)
+        if current_time - self._last_cleanup > self._rate_limit_cleanup_interval:
+            stale_users = [
+                uid for uid, ts in self._last_message_time.items()
+                if current_time - ts > 86400  # Older than 24 hours
+            ]
+            for uid in stale_users:
+                del self._last_message_time[uid]
+            self._last_cleanup = current_time
+            debug_log(DEBUG_INFO, f"Cleaned up {len(stale_users)} stale rate limit entries")
+
         if user_id in self._last_message_time:
             time_diff = current_time - self._last_message_time[user_id]
             if time_diff < (self._rate_limit_ms / 1000):  # Convert ms to seconds
@@ -919,9 +933,23 @@ class AgentChatBridge:
         await update.message.reply_text(f"📤 Message sent...")
 
         await self.agent.send_command(message_text)
-        await asyncio.sleep(1.0)
 
-        output = await self.agent.get_output()
+        try:
+            # Wait for output with agent-specific timeout to prevent Telegram timeout
+            timeout_seconds = getattr(self.agent, 'command_timeout', 30.0)
+            output = await asyncio.wait_for(
+                self.agent.get_output(),
+                timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            timeout_seconds = getattr(self.agent, 'command_timeout', 30.0)
+            await update.message.reply_text(
+                f"⏱️ Response timeout (>{timeout_seconds}s)\n\n"
+                "Command is still running in background.\n"
+                "Output will arrive via continuous monitoring."
+            )
+            return
+
         if output:
             await update.message.reply_text(output.content)
 
@@ -1029,24 +1057,29 @@ def main():
             "name": "Cline",
             "welcome_keywords": ["cline cli"],
             "mode_keywords": ["switch to plan", "switch to act", "plan mode", "act mode"],
+            "command_timeout": 30.0,  # Allow time for file operations
         },
         "codex-cli": {
             "command": ["codex"],
             "name": "Codex CLI",
+            "command_timeout": 45.0,  # May need more time
         },
         "codex-api": {
             "api_url": os.getenv("CODEX_API_URL", "http://localhost:8000/v1/messages"),
             "name": "Codex API",
+            "command_timeout": 60.0,  # Network + processing
         },
         "claude-api": {
             "api_key": os.getenv("ANTHROPIC_API_KEY"),
             "model": "claude-3-5-sonnet-20241022",
             "name": "Claude API",
+            "command_timeout": 45.0,  # Network + complex reasoning
         },
         "openai-api": {
             "api_key": os.getenv("OPENAI_API_KEY"),
             "model": "gpt-4-turbo",
             "name": "OpenAI",
+            "command_timeout": 45.0,  # Network + complex reasoning
         },
     }
 
