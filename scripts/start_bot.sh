@@ -2,7 +2,7 @@
 # Temporary daemon script for Cline Telegram Bot
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOT_SCRIPT="$SCRIPT_DIR/cline_telegram_bot.py"
+BOT_SCRIPT="$SCRIPT_DIR/../cline_telegram_bot.py"
 PID_FILE="$SCRIPT_DIR/bot.pid"
 LOG_FILE="$SCRIPT_DIR/bot.log"
 
@@ -131,9 +131,7 @@ auto_restart_bot() {
     local max_restarts=10
     local restart_delay=30
 
-    echo -e "${GREEN}Starting auto-restart mode...${NC}"
-    echo "Bot will be automatically restarted if it crashes"
-    echo "Press Ctrl+C to stop monitoring"
+    echo -e "${GREEN}Starting auto-restart monitoring daemon...${NC}"
 
     # Start the bot initially
     if ! start_bot; then
@@ -141,38 +139,56 @@ auto_restart_bot() {
         return 1
     fi
 
-    # Monitor loop
-    while true; do
-        sleep 10  # Check every 10 seconds
+    # Daemonize the monitor process (similar to quick_start.py)
+    (
+        # Double-fork technique for proper daemonization
+        # First fork
+        (
+            # Second fork - this becomes the daemon
+            cd /
+            umask 0
 
-        if ! is_running; then
-            restart_count=$((restart_count + 1))
+            # Redirect all output to log file
+            exec >> "$SCRIPT_DIR/monitor.log" 2>&1
 
-            if [ $restart_count -gt $max_restarts ]; then
-                echo -e "${RED}Bot has crashed $max_restarts times. Stopping auto-restart mode.${NC}"
-                return 1
-            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 👁️ Monitor daemon started (PID: $$)"
 
-            echo -e "${YELLOW}Bot crashed (attempt $restart_count/$max_restarts). Restarting in $restart_delay seconds...${NC}"
+            # Monitor loop
+            while true; do
+                sleep 10  # Check every 10 seconds
 
-            # Wait before restarting
-            local countdown=$restart_delay
-            while [ $countdown -gt 0 ]; do
-                echo -n "Restarting in $countdown seconds... "
-                sleep 1
-                countdown=$((countdown - 1))
-                echo -ne "\r"
+                if ! is_running; then
+                    restart_count=$((restart_count + 1))
+
+                    if [ $restart_count -gt $max_restarts ]; then
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Bot has crashed $max_restarts times. Stopping monitor daemon."
+                        exit 1
+                    fi
+
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ Bot crashed (attempt $restart_count/$max_restarts). Restarting in $restart_delay seconds..."
+
+                    # Wait before restarting
+                    sleep $restart_delay
+
+                    # Try to restart
+                    if start_bot >/dev/null 2>&1; then
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Bot restarted successfully"
+                        restart_count=0  # Reset counter on success
+                    else
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Failed to restart bot, will try again"
+                    fi
+                fi
             done
-            echo ""
+        ) &
+    ) &
 
-            # Try to restart
-            if ! start_bot; then
-                echo -e "${RED}Failed to restart bot. Will try again in next cycle.${NC}"
-            else
-                echo -e "${GREEN}Bot restarted successfully${NC}"
-            fi
-        fi
-    done
+    # Give daemon time to start
+    sleep 1
+
+    echo -e "${GREEN}✅ Monitor daemon started${NC}"
+    echo -e "${YELLOW}💡 Monitor will survive terminal close${NC}"
+    echo -e "${YELLOW}💡 Use '$0 stop' to stop bot and monitor${NC}"
+    echo "📝 Monitor log: $SCRIPT_DIR/monitor.log"
 }
 
 # Main script logic
@@ -208,17 +224,19 @@ case "${1:-help}" in
         echo "  start        - Start the bot as a background daemon"
         echo "  stop         - Stop the running bot"
         echo "  restart      - Restart the bot"
-        echo "  monitor      - Auto-restart bot if it crashes (Ctrl+C to stop)"
+        echo "  monitor      - Auto-restart bot daemon (survives terminal close)"
         echo "  status       - Check if bot is running"
         echo "  logs         - Show last 50 lines of logs"
         echo "  tail         - Follow log file in real-time"
         echo "  help         - Show this help message"
         echo ""
         echo "Auto-restart mode:"
-        echo "  - Monitors bot every 10 seconds"
+        echo "  - Monitors bot every 10 seconds as a background daemon"
         echo "  - Automatically restarts if bot crashes"
+        echo "  - Survives terminal disconnection (like quick_start.py)"
         echo "  - Limits to 10 restart attempts to prevent infinite loops"
         echo "  - 30-second delay between restart attempts"
+        echo "  - Use 'stop' command to stop both bot and monitor"
         echo ""
         echo "Files:"
         echo "  PID file: $PID_FILE"

@@ -78,11 +78,12 @@ Usage:
 ```
 
 **Auto-restart mode:**
-- Monitors bot every 10 seconds
-- Automatically restarts if bot crashes
-- 30-second delay between restart attempts
-- Limits to 10 restart attempts to prevent loops
-- Press Ctrl+C to stop monitoring
+  - Monitors bot every 10 seconds as a background daemon
+  - Automatically restarts if bot crashes
+  - Survives terminal disconnection (like quick_start.py)
+  - 30-second delay between restart attempts
+  - Limits to 10 restart attempts to prevent loops
+  - Use 'stop' command to stop both bot and monitor
 
 ### `cline-bot.service`
 **Systemd service file for production deployment.**
