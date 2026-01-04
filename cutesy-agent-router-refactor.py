@@ -357,10 +357,11 @@ class ClineAgent(PTYAgent):
         return should_filter
 
     async def get_custom_commands(self) -> Dict[str, str]:
-        """Cline-specific commands (user-friendly names)"""
+        """Cline-specific commands"""
         return {
             "/plan": "Switch to plan mode - Cline will plan before executing",
             "/act": "Switch to act mode - Cline will execute immediately",
+            "/cancel": "Cancel current task by sending Ctrl+C",
             "/clear": "Clear conversation history and start fresh",
             "/undo": "Undo the last action",
             "/diff": "Show diff of last changes",
@@ -388,6 +389,20 @@ class ClineAgent(PTYAgent):
             if output:
                 response += f"\n{output.content}"
             return response
+
+        elif command == "/cancel":
+            # Send Ctrl+C (0x03) to cancel current task
+            with self.command_lock:
+                if not self.is_running_flag:
+                    return "❌ Agent not running"
+                try:
+                    # Send Ctrl+C (0x03) directly to PTY
+                    bytes_written = os.write(self.master_fd, b"\x03")
+                    debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
+                    return "🛑 Sent cancel signal (Ctrl+C) to agent"
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, f"Failed to send Ctrl+C: {e}")
+                    return f"❌ Failed to send cancel signal: {e}"
 
         elif command == "/clear":
             # Clear conversation history
@@ -680,8 +695,7 @@ class AgentChatBridge:
 
             if await self.agent.start():
                 await update.message.reply_text(
-                    f"✅ {self.agent.name} started\n\n"
-                    f"Available commands:\n{self._format_commands()}"
+                    f"✅ {self.agent.name} session started\n\n{self._format_commands()}"
                 )
                 if not self.output_monitor_task:
                     self.output_monitor_task = asyncio.create_task(self._output_monitor())
@@ -802,16 +816,17 @@ class AgentChatBridge:
 
     def _format_commands(self) -> str:
         """Format available commands for display"""
-        commands_text = "**Built-in Commands:**\n"
-        commands_text += "• `/start` - Start agent\n"
-        commands_text += "• `/stop` - Stop agent\n"
-        commands_text += "• `/status` - Check status\n"
-        commands_text += "• `/help` - Show all commands\n"
+        commands_text = "**Bot Commands:**\n"
+        commands_text += "• Natural language: `show me the current directory`\n"
+        commands_text += "• CLI commands: `git status`, `ls`\n"
 
         if self.custom_commands:
-            commands_text += f"\n**{self.agent.name} Custom Commands:**\n"
             for cmd, description in self.custom_commands.items():
-                commands_text += f"• `{cmd}` - {description}\n"
+                commands_text += f"• `{cmd}` - {description.split(' - ')[0]}\n"
+
+        commands_text += "• `/status` - Check status\n"
+        commands_text += "• `/stop` - End session\n"
+        commands_text += "• `/help` - Show all commands"
 
         return commands_text
 
