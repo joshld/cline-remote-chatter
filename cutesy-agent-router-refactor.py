@@ -362,9 +362,7 @@ class ClineAgent(PTYAgent):
             "/plan": "Switch to plan mode - Cline will plan before executing",
             "/act": "Switch to act mode - Cline will execute immediately",
             "/cancel": "Cancel current task by sending Ctrl+C",
-            "/clear": "Clear conversation history and start fresh",
-            "/undo": "Undo the last action",
-            "/diff": "Show diff of last changes",
+            "/reset": "Force restart - stop current session and start fresh",
         }
 
     async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
@@ -416,10 +414,17 @@ class ClineAgent(PTYAgent):
             result = await self.send_command("undo")
             return f"↩️ Undo executed\n{result}"
 
-        elif command == "/diff":
-            # Show recent changes
-            result = await self.send_command("diff")
-            return f"📝 Recent changes:\n{result}"
+        elif command == "/reset":
+            # Force restart - stop current session and start fresh
+            if self.is_running_flag:
+                await self.stop()
+                await asyncio.sleep(0.5)  # Brief pause for cleanup
+
+            # Start fresh session
+            if await self.start():
+                return "🔄 **Bot Reset Complete**\n\n✅ Fresh Cline session started\n✅ All state cleared\n✅ Ready for new commands"
+            else:
+                return "❌ Reset failed - could not start new session"
 
         else:
             return None  # Use default handling
@@ -712,7 +717,36 @@ class AgentChatBridge:
             await update.message.reply_text(f"Status: {status}{waiting}\nAgent: {self.agent.name}")
 
         elif cmd == "/help":
-            await update.message.reply_text(f"Available commands:\n{self._format_commands()}")
+            help_text = f"""🤖 **Agent-Chat Bridge Help**
+
+**Getting Started:**
+• `/start` - Start a new {self.agent.name} session
+• `/stop` - Stop the current session
+• `/reset` - Force restart (use if bot is stuck)
+
+**Commands:**
+• `/status` - Check bot and session status
+• `/cancel` - Cancel current {self.agent.name} operation
+
+**{self.agent.name} Mode Switching:**
+• `/plan` - Switch {self.agent.name} to planning mode
+• `/act` - Switch {self.agent.name} to action mode
+
+**Usage:**
+• Send natural language: `"show me the current directory"`
+• Send CLI commands: `"git status"`, `"ls -la"`
+• Interactive prompts are supported automatically
+
+**Troubleshooting:**
+• If bot seems stuck, try `/reset`
+• Check `/status` for current state
+• Use `/cancel` to interrupt long-running tasks
+
+**Available Commands:**
+{self._format_commands()}
+
+Need help? The bot will guide you through interactive prompts!"""
+            await update.message.reply_text(help_text)
 
         # Handle custom commands
         elif cmd in self.custom_commands:
