@@ -31,24 +31,10 @@ Cutesy Agent Router is a Python-based Telegram bot that provides a remote interf
 
 ## Requirements
 
-### Production Dependencies
-
 - **Python 3.9+** (tested with 3.10)
-- **python-telegram-bot** - Telegram Bot API wrapper
-- **psutil** - Process and system utilities
-- **python-dotenv** - Environment variable management
+- **Production dependencies**: See [`requirements.txt`](requirements.txt)
+- **Development dependencies**: See [`requirements-dev.txt`](requirements-dev.txt)
 - **Cline CLI tool** (tested with CLI v1.0.8, Core v3.39.2)
-
-### Development Dependencies
-
-- **pytest** - Testing framework
-- **pytest-asyncio** - Async testing support
-- **pytest-cov** - Coverage reporting
-- **black** - Code formatter
-- **isort** - Import sorter
-- **flake8** - Linter
-- **mypy** - Type checker
-- **pre-commit** - Git hooks framework
 
 ## Quick Start
 
@@ -215,12 +201,6 @@ python cline_telegram_bot.py
    - File descriptors are closed
    - Background threads are stopped
    - Resources are cleaned up
-
-## Requirements
-
-- Python 3.9+ (tested with 3.10)
-- Requirements listed in `requirements.txt`
-- Cline CLI tool (tested with CLI v1.0.8, Core v3.39.2)
 
 ## Testing
 
