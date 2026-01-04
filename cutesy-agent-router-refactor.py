@@ -146,7 +146,7 @@ class AgentInterface(ABC):
 
 class PTYAgent(AgentInterface):
     """Base class for PTY-based CLI agents"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.command = config.get("command", ["agent"])
@@ -374,7 +374,11 @@ class ClineAgent(PTYAgent):
     async def get_custom_help(self) -> str:
         """Cline-specific help content"""
         return """
-        """
+**Usage:**
+• Send natural language queries to Cline
+• Send shell commands: `"git status"`, `"ls -la"`, `"pwd"`
+• Cline will execute commands in your project directory
+"""
 
     async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
         """Handle Cline-specific commands"""
@@ -870,9 +874,7 @@ class AgentChatBridge:
 
     def _format_commands(self) -> str:
         """Format available commands for display"""
-        commands_text = "**Bot Commands:**\n"
-        commands_text += "• Natural language: `show me the current directory`\n"
-        commands_text += "• CLI commands: `git status`, `ls`\n"
+        commands_text = ""
 
         if self.custom_commands:
             for cmd, description in self.custom_commands.items():
