@@ -119,6 +119,14 @@ class AgentInterface(ABC):
         """
         return {}
 
+    async def get_custom_help(self) -> str:
+        """Return agent-specific help content to append to base help
+
+        Returns:
+            Additional help text specific to this agent, or empty string
+        """
+        return ""
+
     async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
         """Handle a custom command
 
@@ -361,9 +369,12 @@ class ClineAgent(PTYAgent):
         return {
             "/plan": "Switch to plan mode - Cline will plan before executing",
             "/act": "Switch to act mode - Cline will execute immediately",
-            "/cancel": "Cancel current task by sending Ctrl+C",
-            "/reset": "Force restart - stop current session and start fresh",
         }
+
+    async def get_custom_help(self) -> str:
+        """Cline-specific help content"""
+        return """
+        """
 
     async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
         """Handle Cline-specific commands"""
@@ -387,44 +398,6 @@ class ClineAgent(PTYAgent):
             if output:
                 response += f"\n{output.content}"
             return response
-
-        elif command == "/cancel":
-            # Send Ctrl+C (0x03) to cancel current task
-            with self.command_lock:
-                if not self.is_running_flag:
-                    return "❌ Agent not running"
-                try:
-                    # Send Ctrl+C (0x03) directly to PTY
-                    bytes_written = os.write(self.master_fd, b"\x03")
-                    debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
-                    return "🛑 Sent cancel signal (Ctrl+C) to agent"
-                except Exception as e:
-                    debug_log(DEBUG_ERROR, f"Failed to send Ctrl+C: {e}")
-                    return f"❌ Failed to send cancel signal: {e}"
-
-        elif command == "/clear":
-            # Clear conversation history
-            # For PTY agents, we restart the process
-            await self.stop()
-            await self.start()
-            return "🔄 Agent restarted and conversation cleared"
-
-        elif command == "/undo":
-            # Cline may support undo
-            result = await self.send_command("undo")
-            return f"↩️ Undo executed\n{result}"
-
-        elif command == "/reset":
-            # Force restart - stop current session and start fresh
-            if self.is_running_flag:
-                await self.stop()
-                await asyncio.sleep(0.5)  # Brief pause for cleanup
-
-            # Start fresh session
-            if await self.start():
-                return "🔄 **Bot Reset Complete**\n\n✅ Fresh Cline session started\n✅ All state cleared\n✅ Ready for new commands"
-            else:
-                return "❌ Reset failed - could not start new session"
 
         else:
             return None  # Use default handling
@@ -699,9 +672,14 @@ class AgentChatBridge:
                 return
 
             if await self.agent.start():
-                await update.message.reply_text(
-                    f"✅ {self.agent.name} session started\n\n{self._format_commands()}"
-                )
+                # Show a concise startup message
+                agent_type = "CLI Agent" if hasattr(self.agent, 'command') else "API Agent"
+                startup_msg = f"✅ {self.agent.name} session started ({agent_type})\n\n"
+                startup_msg += "Send messages to interact with the agent\n"
+                startup_msg += "• `/help` - Show all available commands\n"
+                startup_msg += "• `/status` - Check current status"
+
+                await update.message.reply_text(startup_msg)
                 if not self.output_monitor_task:
                     self.output_monitor_task = asyncio.create_task(self._output_monitor())
             else:
@@ -716,36 +694,38 @@ class AgentChatBridge:
             waiting = "\n⏸️ Waiting for input" if self.agent.waiting_for_input else ""
             await update.message.reply_text(f"Status: {status}{waiting}\nAgent: {self.agent.name}")
 
+        elif cmd == "/cancel":
+            if not self.agent.is_running():
+                await update.message.reply_text(f"❌ {self.agent.name} not running. Use /start")
+                return
+
+            # Cancel operation - behavior depends on agent type
+            cancel_result = await self._cancel_operation()
+            await update.message.reply_text(cancel_result)
+
+        elif cmd == "/reset":
+            # Reset agent - behavior depends on agent type
+            reset_result = await self._reset_agent()
+            await update.message.reply_text(reset_result)
+
         elif cmd == "/help":
+            # Get agent-specific help content
+            custom_help = await self.agent.get_custom_help()
+
             help_text = f"""🤖 **Agent-Chat Bridge Help**
 
 **Getting Started:**
 • `/start` - Start a new {self.agent.name} session
 • `/stop` - Stop the current session
-• `/reset` - Force restart (use if bot is stuck)
+• `/reset` - Reset agent state and start fresh
 
 **Commands:**
 • `/status` - Check bot and session status
-• `/cancel` - Cancel current {self.agent.name} operation
-
-**{self.agent.name} Mode Switching:**
-• `/plan` - Switch {self.agent.name} to planning mode
-• `/act` - Switch {self.agent.name} to action mode
-
-**Usage:**
-• Send natural language: `"show me the current directory"`
-• Send CLI commands: `"git status"`, `"ls -la"`
-• Interactive prompts are supported automatically
-
-**Troubleshooting:**
-• If bot seems stuck, try `/reset`
-• Check `/status` for current state
-• Use `/cancel` to interrupt long-running tasks
+• `/cancel` - Cancel current operation
 
 **Available Commands:**
-{self._format_commands()}
-
-Need help? The bot will guide you through interactive prompts!"""
+{self._format_commands()}{custom_help}
+"""
             await update.message.reply_text(help_text)
 
         # Handle custom commands
@@ -775,6 +755,46 @@ Need help? The bot will guide you through interactive prompts!"""
                 f"❌ Unknown command: {cmd}\n\n"
                 f"Available commands:\n{available}"
             )
+
+    async def _cancel_operation(self) -> str:
+        """Cancel current operation - implementation varies by agent type"""
+        # For PTY agents (like Cline), send Ctrl+C
+        if hasattr(self.agent, 'command'):
+            with self.agent.command_lock:
+                try:
+                    # Send Ctrl+C (0x03) directly to PTY
+                    bytes_written = os.write(self.agent.master_fd, b"\x03")
+                    debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
+                    return "🛑 Sent cancel signal (Ctrl+C) to agent"
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, f"Failed to send Ctrl+C: {e}")
+                    return f"❌ Failed to send cancel signal: {e}"
+        else:
+            # For API agents, cancel pending operations/state
+            # For now, just indicate cancellation attempted
+            # Future: could cancel pending HTTP requests, clear queues, etc.
+            return f"🛑 Cancelled current {self.agent.name} operation"
+
+    async def _reset_agent(self) -> str:
+        """Reset agent - behavior depends on agent type"""
+        # For PTY agents (like Cline), restart the entire session
+        if hasattr(self.agent, 'command'):
+            was_running = self.agent.is_running()
+            if was_running:
+                await self.agent.stop()
+                await asyncio.sleep(0.5)  # Brief pause for cleanup
+
+            # Start fresh session
+            if await self.agent.start():
+                return "🔄 **Agent Reset Complete**\n\n✅ Fresh session started\n✅ All state cleared\n✅ Ready for new commands"
+            else:
+                return "❌ Reset failed - could not start new session"
+        else:
+            # For API agents, clear conversation history and reset state
+            if hasattr(self.agent, 'conversation_history'):
+                self.agent.conversation_history = []
+            # Future: could also cancel pending requests, reset other state
+            return f"🔄 **{self.agent.name} Reset Complete**\n\n✅ Conversation history cleared\n✅ Agent state reset"
 
     async def handle_all_text(self, update, context):
         """Handle all text messages (commands and regular messages)"""
@@ -857,10 +877,6 @@ Need help? The bot will guide you through interactive prompts!"""
         if self.custom_commands:
             for cmd, description in self.custom_commands.items():
                 commands_text += f"• `{cmd}` - {description.split(' - ')[0]}\n"
-
-        commands_text += "• `/status` - Check status\n"
-        commands_text += "• `/stop` - End session\n"
-        commands_text += "• `/help` - Show all commands"
 
         return commands_text
 
